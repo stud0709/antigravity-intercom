@@ -9,12 +9,19 @@ import threading
 import gzip
 import base64
 import mimetypes
+import hashlib
+import urllib.request
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import nostr_sdk
 
 DEFAULT_RELAYS = [
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net"
+]
+
+DEFAULT_BLOSSOM_SERVERS = [
+    "https://blossom.primal.net/upload"
 ]
 
 INTERCOM_KIND = 20000
@@ -77,6 +84,38 @@ def resolve_attachment_path(path: str) -> str:
     log_debug(f"[PathResolver] Attachment path not found on disk: '{path}'")
     return None
 
+def upload_to_blossom(data_bytes: bytes, keys: nostr_sdk.Keys) -> str:
+    armored_text = base64.b64encode(data_bytes)
+    sha256_hex = hashlib.sha256(armored_text).hexdigest()
+    
+    for upload_url in DEFAULT_BLOSSOM_SERVERS:
+        try:
+            u_tag = nostr_sdk.Tag.parse(["u", upload_url])
+            m_tag = nostr_sdk.Tag.parse(["method", "PUT"])
+            p_tag = nostr_sdk.Tag.parse(["payload", sha256_hex])
+            x_tag = nostr_sdk.Tag.parse(["x", sha256_hex])
+            t_tag = nostr_sdk.Tag.parse(["t", "upload"])
+            
+            builder = nostr_sdk.EventBuilder(nostr_sdk.Kind(24242), "").tags([u_tag, m_tag, p_tag, x_tag, t_tag])
+            event = builder.sign_with_keys(keys)
+            auth_header = "Nostr " + base64.b64encode(event.as_json().encode("utf-8")).decode("ascii")
+            
+            req = urllib.request.Request(upload_url, data=armored_text, method="PUT")
+            req.add_header("Authorization", auth_header)
+            req.add_header("Content-Type", "text/plain")
+            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                file_url = resp_data.get("url")
+                if file_url:
+                    log_debug(f"[Blossom] Encrypted upload success to {file_url}")
+                    return file_url
+        except Exception as e:
+            log_debug(f"[Blossom] Upload error to {upload_url}: {e}")
+            
+    raise RuntimeError("Failed to upload encrypted attachment to any Blossom server.")
+
 async def _async_publish(sender_conversation_id: str, recipient_conversation_id: str, content: str, attachment_path: str, topic: str, relay_urls: list):
     topic = sanitize_topic(topic)
     keys = nostr_sdk.Keys.generate()
@@ -104,18 +143,42 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
             with open(resolved_path, "rb") as f:
                 raw_bytes = f.read()
                 
-            compressed = gzip.compress(raw_bytes)
-            b64_data = base64.b64encode(compressed).decode("ascii")
+            compressed_bytes = gzip.compress(raw_bytes)
             
-            attachment_obj = {
-                "file_name": file_name,
-                "mime_type": mime_type,
-                "encoding": "gzip+base64",
-                "data": b64_data
-            }
-            log_debug(f"[Publisher] Encoded attachment '{file_name}' ({len(raw_bytes)} bytes -> {len(compressed)} compressed bytes)")
+            # Hybrid threshold: If compressed size <= 45 KB, use inline Gzip+Base64. Else, use Encrypted Blossom upload.
+            if len(compressed_bytes) <= 45 * 1024:
+                b64_data = base64.b64encode(compressed_bytes).decode("ascii")
+                attachment_obj = {
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "encoding": "gzip+base64",
+                    "data": b64_data
+                }
+                log_debug(f"[Publisher] Inline encoded attachment '{file_name}' ({len(raw_bytes)} bytes -> {len(compressed_bytes)} compressed bytes)")
+            else:
+                aes_key = AESGCM.generate_key(bit_length=256)
+                aesgcm = AESGCM(aes_key)
+                nonce = os.urandom(12)
+                
+                encrypted_bytes = aesgcm.encrypt(nonce, compressed_bytes, None)
+                armored_sha256 = hashlib.sha256(base64.b64encode(encrypted_bytes)).hexdigest()
+                
+                log_debug(f"[Publisher] Large file detected ({len(raw_bytes)} bytes). Encrypting with AES-256-GCM & uploading to Blossom...")
+                blossom_file_url = upload_to_blossom(encrypted_bytes, keys)
+                
+                attachment_obj = {
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "encoding": "blossom+aes256gcm",
+                    "url": blossom_file_url,
+                    "aes_key": base64.b64encode(aes_key).decode("ascii"),
+                    "nonce": base64.b64encode(nonce).decode("ascii"),
+                    "sha256": armored_sha256
+                }
+                log_debug(f"[Publisher] Encrypted Blossom attachment packaged for '{file_name}'")
+                
         except Exception as att_err:
-            log_debug(f"[Publisher] Error compressing attachment: {att_err}")
+            log_debug(f"[Publisher] Error packaging attachment: {att_err}")
             
     payload_dict = {
         "sender_conversation_id": sender_conversation_id,
@@ -232,12 +295,38 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     file_name = attachment.get("file_name", "attachment.bin")
                     mime_type = attachment.get("mime_type", "application/octet-stream")
                     encoding = attachment.get("encoding")
-                    b64_data = attachment.get("data")
                     
-                    if encoding == "gzip+base64" and b64_data:
-                        compressed_bytes = base64.b64decode(b64_data)
-                        raw_bytes = gzip.decompress(compressed_bytes)
+                    raw_bytes = None
+                    if encoding == "gzip+base64":
+                        b64_data = attachment.get("data")
+                        if b64_data:
+                            compressed_bytes = base64.b64decode(b64_data)
+                            raw_bytes = gzip.decompress(compressed_bytes)
+                    elif encoding == "blossom+aes256gcm":
+                        blossom_url = attachment.get("url")
+                        b64_key = attachment.get("aes_key")
+                        b64_nonce = attachment.get("nonce")
+                        expected_sha256 = attachment.get("sha256")
                         
+                        log_debug(f"[Nostr Intercom Listener] Downloading encrypted Blossom attachment from {blossom_url}...")
+                        req = urllib.request.Request(blossom_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                        with urllib.request.urlopen(req, timeout=20) as resp:
+                            dl_armored = resp.read()
+                            
+                        actual_sha256 = hashlib.sha256(dl_armored).hexdigest()
+                        if expected_sha256 and actual_sha256 != expected_sha256:
+                            raise ValueError(f"SHA256 mismatch! Expected {expected_sha256}, got {actual_sha256}")
+                            
+                        encrypted_bytes = base64.b64decode(dl_armored)
+                        aes_key = base64.b64decode(b64_key)
+                        nonce = base64.b64decode(b64_nonce)
+                        
+                        aesgcm = AESGCM(aes_key)
+                        compressed_bytes = aesgcm.decrypt(nonce, encrypted_bytes, None)
+                        raw_bytes = gzip.decompress(compressed_bytes)
+                        log_debug(f"[Nostr Intercom Listener] Successfully downloaded, verified & decrypted Blossom attachment '{file_name}'")
+                        
+                    if raw_bytes is not None:
                         target_attachments_dir = os.path.join(target_brain_dir, "attachments")
                         os.makedirs(target_attachments_dir, exist_ok=True)
                         
@@ -247,7 +336,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                             
                         clean_saved_path = saved_file_path.replace("\\", "/")
                         attachment_info_str = f". It contains attachment of type {mime_type}, {file_name} downloaded into {clean_saved_path}"
-                        log_debug(f"[Nostr Intercom Listener] Decoded & saved attachment to {clean_saved_path}")
+                        log_debug(f"[Nostr Intercom Listener] Saved attachment to {clean_saved_path}")
                 except Exception as att_dec_err:
                     log_debug(f"[Nostr Intercom Listener] Error processing attachment: {att_dec_err}")
                     
