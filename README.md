@@ -12,8 +12,9 @@
 ## ✨ Features
 
 - **🔒 End-to-End Encryption (AES-256-GCM E2EE)**: 100% of messages, metadata, and attachment references are cryptographically sealed. Relays and observers only see unreadable ciphertext blobs.
-- **🎫 Self-Contained Pairing Tokens**: One-step agent pairing (`AGYPAIR-...`). Bundles topic routing, 256-bit AES pre-shared keys (PSK), and sender identity into a single token.
-- **💾 Persistent Pairings across Restarts**: Pairing configurations are saved on disk (`intercom_pairings.json`) and automatically re-subscribed upon Antigravity restarts or reboots.
+- **🎫 Self-Contained Pairing Tokens with TTL**: One-step agent pairing (`AGYPAIR-...`). Bundles topic routing, 256-bit AES pre-shared keys (PSK), sender identity, and configurable Time-To-Live (TTL) expiration.
+- **🧹 Automatic Registry Pruning & Garbage Collection**: Automatically cleans up expired pairings and purges entries when a local conversation is deleted from the filesystem.
+- **💾 Persistent Pairings across Restarts**: Active pairing configurations are saved on disk (`intercom_pairings.json`) and automatically re-subscribed upon Antigravity restarts or reboots.
 - **⚡ Real-Time Cross-Network Intercom**: Asynchronous pub/sub over public or private Nostr relay pools (`damus.io`, `nos.lol`, `primal.net`).
 - **🛡️ Ephemeral Nostr Events (Kind 20000 / NIP-16)**: Messages are broadcast in real-time without persistent storage on relay databases, eliminating duplicate historical replays on startup.
 - **📦 Hybrid Attachment Pipeline**:
@@ -73,8 +74,8 @@ sequenceDiagram
     participant Relay as Nostr Relay
     participant AgentB as Agent B (Machine 2)
 
-    User->>AgentA: "Create pairing token for Agent B"
-    AgentA->>AgentA: Calls intercom_generate_pairing_token()
+    User->>AgentA: "Create pairing token valid for 24h"
+    AgentA->>AgentA: Calls intercom_generate_pairing_token(ttl_hours=24)
     AgentA-->>User: Returns AGYPAIR-... token
     
     User->>AgentB: "Connect using token AGYPAIR-..."
@@ -87,7 +88,8 @@ sequenceDiagram
    ```python
    intercom_generate_pairing_token(
        sender_conversation_id="my_conversation_id",
-       recipient_hint="Remote Agent Name"
+       recipient_hint="Remote Agent Name",
+       ttl_hours=24.0 # Optional TTL in hours (defaults to 24)
    )
    ```
 2. **Acceptor Agent**:

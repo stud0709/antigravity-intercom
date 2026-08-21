@@ -14,13 +14,16 @@ For installation instructions on new machines or dependency details, see [SETUP.
 
 ---
 
-## 🧠 Machine-Global Pairing Registry
+## 🧠 Machine-Global Pairing Registry & Lifecycle
 
 All active connections and encryption keys are stored persistently on disk in the machine-global registry:
 `~/.gemini/antigravity/brain/intercom_pairings.json`
 
 - **Single Background Daemon**: A single `nostr_listener.py` daemon manages real-time event subscriptions across all paired topics on the machine.
-- **Restart Persistence**: All pairings survive Antigravity IDE restarts and system reboots. You only need to pair once per conversation pair.
+- **Restart Persistence**: All active pairings survive Antigravity IDE restarts and system reboots.
+- **Automatic Pruning & Garbage Collection**:
+  - **TTL Expiration**: Pairings automatically expire after their configured Time-To-Live (`ttl_hours`, default 24h).
+  - **Deleted Conversation Cleanup**: When a local conversation folder is deleted from the filesystem, its associated pairing is automatically purged from the registry.
 
 ---
 
@@ -34,15 +37,16 @@ When the user asks you to connect, pair with, or talk to another agent:
 1. Call `intercom_generate_pairing_token`:
    - `sender_conversation_id`: Your active conversation ID (found in your conversation metadata or environment).
    - `recipient_hint`: (Optional) Name or alias for the remote agent (e.g. `"Backend Diagnostic Agent"`).
+   - `ttl_hours`: (Optional) Expiration period in hours (defaults to `24.0`). For temporary sessions, you can set `ttl_hours=2.0` or for long-lived collaboration `ttl_hours=168.0` (7 days).
 2. The tool outputs a self-contained token string: `AGYPAIR-...`.
 3. Present the token to the user and instruct them to give it to the other agent:
-   > *"Here is your pairing token: `AGYPAIR-...`. Please provide this to the other agent to complete the secure connection."*
+   > *"Here is your pairing token (valid for X hours): `AGYPAIR-...`. Please provide this to the other agent to complete the secure connection."*
 
 #### Scenario B: The User Gives You a Pairing Token (`AGYPAIR-...`)
 1. Call `intercom_pair`:
    - `pairing_token`: The `AGYPAIR-...` token provided by the user.
    - `my_conversation_id`: Your active conversation ID.
-2. The tool automatically registers the topic and AES-256 key into `intercom_pairings.json` and broadcasts an encrypted handshake to the remote agent.
+2. The tool automatically verifies token expiration, registers the topic and AES-256 key into `intercom_pairings.json`, and broadcasts an encrypted handshake to the remote agent.
 3. Confirm connection to the user:
    > *"Successfully connected and paired via End-to-End Encryption! Ready to communicate."*
 

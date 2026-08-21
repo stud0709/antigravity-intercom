@@ -75,7 +75,7 @@ def get_default_topic():
     return "antigravity_intercom"
 
 # ---------------------------------------------------------------------------
-# Pairing Registry & Token Management
+# Pairing Registry, TTL & Stale Conversation Pruning
 # ---------------------------------------------------------------------------
 
 def get_pairings_file_path() -> str:
@@ -83,6 +83,70 @@ def get_pairings_file_path() -> str:
     brain_dir = os.path.join(home_dir, ".gemini", "antigravity", "brain")
     os.makedirs(brain_dir, exist_ok=True)
     return os.path.join(brain_dir, "intercom_pairings.json")
+
+def prune_stale_pairings(data: dict) -> tuple[dict, bool]:
+    """
+    Prunes pairings where:
+    1. TTL has expired (expires_at is in the past).
+    2. Local conversation ID folder no longer exists in brain directory.
+    Returns (cleaned_data, changed_boolean).
+    """
+    home_dir = os.path.expanduser("~")
+    brain_root = os.path.join(home_dir, ".gemini", "antigravity", "brain")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    changed = False
+    
+    pairings = data.get("pairings", {})
+    topics = data.get("topics", {})
+    
+    stale_recipients = []
+    
+    for r_id, p_info in list(pairings.items()):
+        # 1. Check TTL Expiration
+        exp_str = p_info.get("expires_at")
+        if exp_str:
+            try:
+                exp_dt = datetime.datetime.fromisoformat(exp_str)
+                if now > exp_dt:
+                    log_debug(f"[Prune] Pairing for '{r_id}' expired at {exp_str}. Pruning.")
+                    stale_recipients.append(r_id)
+                    changed = True
+                    continue
+            except Exception:
+                pass
+                
+        # 2. Check if local conversation folder exists
+        local_id = p_info.get("local_conversation_id")
+        if local_id and not local_id.startswith("pending_") and not local_id.startswith("test_"):
+            local_brain_path = os.path.join(brain_root, local_id)
+            if not os.path.exists(local_brain_path):
+                log_debug(f"[Prune] Local conversation '{local_id}' no longer exists on disk. Pruning pairing for '{r_id}'.")
+                stale_recipients.append(r_id)
+                changed = True
+                continue
+                
+    for r_id in stale_recipients:
+        p_info = pairings.pop(r_id, None)
+        if p_info:
+            topic = p_info.get("topic")
+            if topic and topic in topics:
+                topics.pop(topic, None)
+                
+    # Also prune any orphan or expired topics
+    for t_name, t_info in list(topics.items()):
+        exp_str = t_info.get("expires_at")
+        if exp_str:
+            try:
+                exp_dt = datetime.datetime.fromisoformat(exp_str)
+                if now > exp_dt:
+                    topics.pop(t_name, None)
+                    changed = True
+            except Exception:
+                pass
+                
+    data["pairings"] = pairings
+    data["topics"] = topics
+    return data, changed
 
 def load_pairings() -> dict:
     with PAIRINGS_LOCK:
@@ -96,12 +160,17 @@ def load_pairings() -> dict:
                     data["pairings"] = {}
                 if "topics" not in data:
                     data["topics"] = {}
-                return data
+                    
+                cleaned_data, changed = prune_stale_pairings(data)
+                if changed:
+                    with open(file_path, "w", encoding="utf-8") as f_out:
+                        json.dump(cleaned_data, f_out, indent=2)
+                return cleaned_data
         except Exception as e:
             log_debug(f"[Pairings] Error loading {file_path}: {e}")
             return {"pairings": {}, "topics": {}}
 
-def save_pairing(remote_conversation_id: str, topic: str, psk_b64: str, local_conversation_id: str = "", alias: str = ""):
+def save_pairing(remote_conversation_id: str, topic: str, psk_b64: str, local_conversation_id: str = "", alias: str = "", expires_at: str = None):
     topic = sanitize_topic(topic)
     with PAIRINGS_LOCK:
         file_path = get_pairings_file_path()
@@ -120,7 +189,7 @@ def save_pairing(remote_conversation_id: str, topic: str, psk_b64: str, local_co
             
         now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
         
-        data["pairings"][remote_conversation_id] = {
+        pairing_entry = {
             "remote_conversation_id": remote_conversation_id,
             "local_conversation_id": local_conversation_id,
             "topic": topic,
@@ -128,19 +197,29 @@ def save_pairing(remote_conversation_id: str, topic: str, psk_b64: str, local_co
             "created_at": now_str,
             "alias": alias
         }
+        if expires_at:
+            pairing_entry["expires_at"] = expires_at
+            
+        data["pairings"][remote_conversation_id] = pairing_entry
         
-        data["topics"][topic] = {
+        topic_entry = {
             "topic": topic,
             "preshared_key": psk_b64,
             "remote_conversation_id": remote_conversation_id,
             "local_conversation_id": local_conversation_id,
             "updated_at": now_str
         }
-        
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        if expires_at:
+            topic_entry["expires_at"] = expires_at
             
-        log_debug(f"[Pairings] Saved pairing for recipient '{remote_conversation_id}' on topic '{topic}'")
+        data["topics"][topic] = topic_entry
+        
+        cleaned_data, _ = prune_stale_pairings(data)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(cleaned_data, f, indent=2)
+            
+        ttl_info = f" (Expires at {expires_at})" if expires_at else ""
+        log_debug(f"[Pairings] Saved pairing for recipient '{remote_conversation_id}' on topic '{topic}'{ttl_info}")
 
 def get_pairing_for_recipient(recipient_id: str) -> dict:
     data = load_pairings()
@@ -175,10 +254,15 @@ def get_all_paired_topics() -> list:
             topics.add(sanitize_topic(p["topic"]))
     return list(topics)
 
-def generate_pairing_token(local_conversation_id: str, recipient_hint: str = "") -> str:
+def generate_pairing_token(local_conversation_id: str, recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
     topic_uuid = f"agy_{uuid.uuid4().hex[:16]}"
     aes_key = AESGCM.generate_key(bit_length=256)
     psk_b64 = base64.b64encode(aes_key).decode("ascii")
+    
+    # Calculate expiration timestamp
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires_dt = now + datetime.timedelta(hours=float(ttl_hours))
+    expires_at_str = expires_dt.isoformat()
     
     # Save the pending pairing into our local registry
     placeholder_id = recipient_hint if recipient_hint else f"pending_{topic_uuid}"
@@ -187,7 +271,8 @@ def generate_pairing_token(local_conversation_id: str, recipient_hint: str = "")
         topic=topic_uuid,
         psk_b64=psk_b64,
         local_conversation_id=local_conversation_id,
-        alias=recipient_hint
+        alias=recipient_hint,
+        expires_at=expires_at_str
     )
     
     token_dict = {
@@ -196,14 +281,15 @@ def generate_pairing_token(local_conversation_id: str, recipient_hint: str = "")
         "key": psk_b64,
         "sender_id": local_conversation_id,
         "relays": DEFAULT_RELAYS,
-        "hint": recipient_hint
+        "hint": recipient_hint,
+        "expires_at": expires_at_str
     }
     
     token_bytes = json.dumps(token_dict).encode("utf-8")
     token_b64 = base64.urlsafe_b64encode(token_bytes).decode("ascii").rstrip("=")
     token_str = f"AGYPAIR-{token_b64}"
     
-    log_debug(f"[PairingToken] Generated token for local conversation '{local_conversation_id}' on topic '{topic_uuid}'")
+    log_debug(f"[PairingToken] Generated token for '{local_conversation_id}' on topic '{topic_uuid}' (TTL: {ttl_hours}h, Expires: {expires_at_str})")
     return token_str
 
 def consume_pairing_token(token_str: str, my_conversation_id: str) -> dict:
@@ -227,16 +313,30 @@ def consume_pairing_token(token_str: str, my_conversation_id: str) -> dict:
     topic = token_dict.get("topic")
     psk_b64 = token_dict.get("key")
     remote_sender_id = token_dict.get("sender_id")
+    expires_at = token_dict.get("expires_at")
     
     if not topic or not psk_b64 or not remote_sender_id:
         raise ValueError("Pairing token is missing required connection fields.")
         
+    # Validate TTL expiration
+    if expires_at:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expires_at)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if now > exp_dt:
+                raise ValueError(f"Pairing token expired at {expires_at}. Please request a fresh pairing token.")
+        except ValueError as ve:
+            if "Pairing token expired" in str(ve):
+                raise
+            log_debug(f"[PairingToken] Warning: Could not parse expires_at timestamp: {expires_at}")
+            
     save_pairing(
         remote_conversation_id=remote_sender_id,
         topic=topic,
         psk_b64=psk_b64,
         local_conversation_id=my_conversation_id,
-        alias=token_dict.get("hint", "")
+        alias=token_dict.get("hint", ""),
+        expires_at=expires_at
     )
     
     # Send an encrypted handshake message to the remote agent over Nostr
@@ -265,11 +365,13 @@ def consume_pairing_token(token_str: str, my_conversation_id: str) -> dict:
             
     threading.Thread(target=_send_handshake, daemon=True).start()
     
+    exp_info = f" (Valid until {expires_at})" if expires_at else ""
     return {
         "status": "paired",
         "remote_conversation_id": remote_sender_id,
         "topic": topic,
-        "message": f"Successfully paired with remote conversation '{remote_sender_id}' on encrypted channel '{topic}'."
+        "expires_at": expires_at,
+        "message": f"Successfully paired with remote conversation '{remote_sender_id}' on encrypted channel '{topic}'{exp_info}."
     }
 
 # ---------------------------------------------------------------------------
@@ -771,16 +873,17 @@ async def _run_listener_loop(relays: list):
     await client.subscribe(f, None)
     log_debug(f"[Nostr Intercom Listener] Subscribed to Kind {INTERCOM_KIND} topics {list(topics)} since {now_ts.as_secs()} across relays.")
     
-    # Background task to monitor for newly added pairings and update subscriptions dynamically
+    # Background task to monitor for newly added pairings, expired TTLs, deleted local conversations, and update subscriptions dynamically
     async def _topic_refresher():
         global ACTIVE_LISTENER_TOPICS
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
             try:
+                # Trigger pruning on read
                 current_topics = set(get_all_paired_topics())
                 current_topics.add(get_default_topic())
                 if current_topics != ACTIVE_LISTENER_TOPICS:
-                    log_debug(f"[Nostr Intercom Listener] New pairing detected! Updating subscriptions to: {list(current_topics)}")
+                    log_debug(f"[Nostr Intercom Listener] Subscriptions updated! Current active topics: {list(current_topics)}")
                     new_f = nostr_sdk.Filter().kind(nostr_sdk.Kind(INTERCOM_KIND)).hashtags(list(current_topics)).since(now_ts)
                     await client.subscribe(new_f, None)
                     ACTIVE_LISTENER_TOPICS = current_topics

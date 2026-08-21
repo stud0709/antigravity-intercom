@@ -41,19 +41,21 @@ except Exception as e:
     sys.stderr.write(f"Warning: Failed to auto-start background Nostr listener process: {e}\n")
 
 @mcp.tool()
-def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint: str = "") -> str:
+def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
     """
     Generates a secure, self-contained pairing token (Topic UUID + AES-256-GCM Key).
+    Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours).
     Give this token to another agent/conversation to pair with them end-to-end encrypted.
     """
     import importlib
     importlib.reload(nostr_relay)
     token = nostr_relay.generate_pairing_token(
         local_conversation_id=sender_conversation_id,
-        recipient_hint=recipient_hint
+        recipient_hint=recipient_hint,
+        ttl_hours=ttl_hours
     )
     return (
-        f"Pairing token generated successfully!\n\n"
+        f"Pairing token generated successfully (valid for {ttl_hours} hours)!\n\n"
         f"Share this token with the other agent:\n{token}\n\n"
         f"The other agent should call intercom_pair(pairing_token='{token}', my_conversation_id='<THEIR_ID>') to complete the secure connection."
     )
