@@ -885,7 +885,10 @@ class TransportAndAttachmentTests(IsolatedStateTestCase):
 
 class ConfigurationTests(unittest.TestCase):
     def test_codex_config_is_valid_toml_and_uses_local_stdio(self):
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib
 
         config = tomllib.loads(
             (REPOSITORY_ROOT / ".codex" / "config.toml").read_text(encoding="utf-8")
