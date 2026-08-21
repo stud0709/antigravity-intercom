@@ -5,12 +5,22 @@ description: Enables bidirectional agent communication and diagnostic synchroniz
 
 # Antigravity Intercom Skill
 
-This skill enables you to securely connect and communicate with other agent conversations across machines and networks using self-contained **Pairing Tokens** and **AES-256-GCM End-to-End Encryption (E2EE)** over Nostr relays.
+This skill enables autonomous AI agents to securely discover, pair with, and communicate with other agent conversations across machines and networks using self-contained **Pairing Tokens** and **AES-256-GCM End-to-End Encryption (E2EE)** over Nostr relays.
 
 ---
 
 ## 📖 Installation & Setup
-For installation instructions on new machines or configuration details, see [SETUP.md](file:///C:/Users/YuriyDzhenyeyev/git/antigrativy_intercom/.agents/skills/antigravity-intercom/SETUP.md).
+For installation instructions on new machines or dependency details, see [SETUP.md](file:///C:/Users/YuriyDzhenyeyev/git/antigrativy_intercom/.agents/skills/antigravity-intercom/SETUP.md).
+
+---
+
+## 🧠 Machine-Global Pairing Registry
+
+All active connections and encryption keys are stored persistently on disk in the machine-global registry:
+`~/.gemini/antigravity/brain/intercom_pairings.json`
+
+- **Single Background Daemon**: A single `nostr_listener.py` daemon manages real-time event subscriptions across all paired topics on the machine.
+- **Restart Persistence**: All pairings survive Antigravity IDE restarts and system reboots. You only need to pair once per conversation pair.
 
 ---
 
@@ -18,46 +28,59 @@ For installation instructions on new machines or configuration details, see [SET
 
 ### 1. Connecting Conversations with a Pairing Token (First-Time Setup)
 
-To establish a secure, encrypted tunnel between two conversations:
+When the user asks you to connect, pair with, or talk to another agent:
 
-- **Step A (Initiator)**:
-  Call `intercom_generate_pairing_token` with:
-  - `sender_conversation_id`: Your own active conversation ID.
-  - `recipient_hint`: (Optional) Name or hint for the remote agent.
-  - *Returns*: An `AGYPAIR-...` token. Provide this token to the user to give to the other agent.
+#### Scenario A: You are Initiating the Connection
+1. Call `intercom_generate_pairing_token`:
+   - `sender_conversation_id`: Your active conversation ID (found in your conversation metadata or environment).
+   - `recipient_hint`: (Optional) Name or alias for the remote agent (e.g. `"Backend Diagnostic Agent"`).
+2. The tool outputs a self-contained token string: `AGYPAIR-...`.
+3. Present the token to the user and instruct them to give it to the other agent:
+   > *"Here is your pairing token: `AGYPAIR-...`. Please provide this to the other agent to complete the secure connection."*
 
-- **Step B (Acceptor)**:
-  When given an `AGYPAIR-...` token from another conversation:
-  Call `intercom_pair` with:
-  - `pairing_token`: The `AGYPAIR-...` token string.
-  - `my_conversation_id`: Your own active conversation ID.
-  - *Result*: The connection is saved to your local registry (`intercom_pairings.json`), and an encrypted handshake is automatically sent to the remote agent.
-
-> 💡 **Pairings are persistent!** Once paired, the connection is retained across Antigravity restarts and machine reboots.
+#### Scenario B: The User Gives You a Pairing Token (`AGYPAIR-...`)
+1. Call `intercom_pair`:
+   - `pairing_token`: The `AGYPAIR-...` token provided by the user.
+   - `my_conversation_id`: Your active conversation ID.
+2. The tool automatically registers the topic and AES-256 key into `intercom_pairings.json` and broadcasts an encrypted handshake to the remote agent.
+3. Confirm connection to the user:
+   > *"Successfully connected and paired via End-to-End Encryption! Ready to communicate."*
 
 ---
 
 ### 2. Sending Messages & Attachments (End-to-End Encrypted)
 
-To send messages or files to a paired conversation (e.g., conversation ID `X`):
-1. Call the `intercom_nostr_send_message` tool.
-2. Provide:
-   - `sender_conversation_id`: Your own active conversation ID.
-   - `recipient_conversation_id`: The target conversation ID `X`.
-   - `content`: The structured markdown report or questions you wish to transmit.
-   - `attachment_path`: (Optional) Absolute path to a local file or transcript (`.jsonl`, `.txt`, `.pdf`, `.bin`, etc.). Small files are gzipped and sent inline; large files are encrypted with AES-256-GCM and stored on Blossom.
+Once paired, call `intercom_nostr_send_message` to transmit messages and files:
+
+```python
+intercom_nostr_send_message(
+    sender_conversation_id="<YOUR_ACTIVE_CONVERSATION_ID>",
+    recipient_conversation_id="<TARGET_CONVERSATION_ID>",
+    content="Diagnostic update or markdown report content.",
+    attachment_path="C:/path/to/data.json" # Optional local file path
+)
+```
+
+- **Encryption**: Automatically looks up the recipient in `intercom_pairings.json` and encrypts the entire payload with AES-256-GCM.
+- **Hybrid Attachments**:
+  - Small files ($\le$ 45 KB compressed) are compressed with Gzip, Base64-encoded, and embedded inline.
+  - Large files (> 45 KB) are encrypted client-side with AES-256-GCM and uploaded to Blossom servers (`blossom.primal.net`) with decryption keys transmitted only inside the encrypted payload.
 
 ---
 
 ### 3. Processing and Replying to Inbound Messages & Attachments
 
-When you receive an inbox message delivered via the background Nostr listener:
-- **Standard inbound format**:
-  `message from conversation Y, use antigravity-intercom to answer: <the original message>`
-- **Inbound message with attachment format**:
-  `message from conversation Y, use antigravity-intercom to answer: <the original message>. It contains attachment of type <mime_type>, <file_name> downloaded into <saved_file_path>`
-- To reply, call `intercom_nostr_send_message` with:
+When the background listener delivers an inbound message to your conversation, it appears as:
+- **Standard Inbound Format**:
+  `message from conversation <SENDER_ID>, use antigravity-intercom to answer: <content>`
+- **Inbound Message with Attachment Format**:
+  `message from conversation <SENDER_ID>, use antigravity-intercom to answer: <content>. It contains attachment of type <mime_type>, <file_name> downloaded into <saved_file_path>`
+
+#### How to Reply:
+1. Extract `<SENDER_ID>` from the message prefix.
+2. If an attachment is mentioned, inspect or read `<saved_file_path>` directly from disk.
+3. Call `intercom_nostr_send_message` with:
    - `sender_conversation_id`: Your own active conversation ID.
-   - `recipient_conversation_id`: The sender ID `Y` extracted from the message prefix.
+   - `recipient_conversation_id`: The extracted `<SENDER_ID>`.
    - `content`: Your reply details.
-   - `attachment_path`: (Optional) Reply attachment path if sending files back.
+   - `attachment_path`: (Optional) Reply file path if sending data back.
