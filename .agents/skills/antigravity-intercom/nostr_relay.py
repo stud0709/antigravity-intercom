@@ -257,6 +257,8 @@ def get_all_paired_topics() -> list:
 def generate_pairing_token(local_conversation_id: str, recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
     topic_uuid = f"agy_{uuid.uuid4().hex[:16]}"
     aes_key = AESGCM.generate_key(bit_length=256)
+    psk_b64 = base64.b64encode(aes_key).decode("ascii")
+    
     # Calculate expiration timestamp (ttl_hours <= 0 or None means no expiration / permanent)
     now = datetime.datetime.now(datetime.timezone.utc)
     if ttl_hours is not None and float(ttl_hours) > 0:
