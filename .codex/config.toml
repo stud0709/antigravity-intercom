@@ -1,0 +1,25 @@
+[mcp_servers.antigravity_intercom]
+command = ".venv/Scripts/python.exe"
+args = [".agents/skills/antigravity-intercom/server.py"]
+cwd = "."
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+default_tools_approval_mode = "writes"
+
+[mcp_servers.antigravity_intercom.env]
+INTERCOM_RUNTIME = "codex"
+INTERCOM_ALLOWED_ATTACHMENT_ROOTS = ".intercom-share"
+
+[mcp_servers.antigravity_intercom.tools.intercom_list_pairings]
+approval_mode = "approve"
+
+[mcp_servers.antigravity_intercom.tools.intercom_receive_messages]
+approval_mode = "approve"
+
+[mcp_servers.antigravity_intercom.tools.intercom_read_message]
+approval_mode = "prompt"
+
+[mcp_servers.antigravity_intercom.tools.intercom_delete_message]
+approval_mode = "prompt"

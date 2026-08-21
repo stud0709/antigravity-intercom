@@ -1,50 +1,103 @@
-# Antigravity Intercom Installation & Setup Guide
+# Installation and configuration
 
-This guide details how to install and configure `antigravity-intercom` on new machines or agent environments. The skill folder is completely self-contained and holds all required executable scripts (`server.py`, `nostr_relay.py`, `nostr_listener.py`).
+## Dependencies
 
----
+Use Python 3.10 or newer from the repository root.
 
-## 🛠️ Installation Steps
-
-### Step 1: Install Python Dependencies
-```bash
-pip install fastmcp nostr-sdk cryptography
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### Step 2: Install Skill Directory
-Copy or link the self-contained `antigravity-intercom` folder to your global skills directory:
-`~/.gemini/config/skills/antigravity-intercom/`
+On macOS or Linux, use `.venv/bin/python` instead.
 
-The folder contains:
-- `SKILL.md`: Authoritative AI prompt playbook for agents.
-- `SETUP.md`: Installation and configuration reference.
-- `server.py`: FastMCP server exposing pairing and messaging tools.
-- `nostr_relay.py`: Nostr relay transport, AES-256-GCM encryption, Blossom uploads, and pairing registry.
-- `nostr_listener.py`: Detached single-instance background listener daemon.
+## Codex
 
-### Step 3: Register MCP Server (`mcp_config.json`)
-Add `antigravity-intercom` to your `mcp_config.json` (located at `~/.gemini/config/mcp_config.json`):
+Codex supports project-scoped STDIO MCP servers in `.codex/config.toml` for trusted projects. This repository includes:
 
-```json
-"antigravity-intercom": {
-  "command": "python",
-  "args": [
-    "C:/Users/<username>/.gemini/config/skills/antigravity-intercom/server.py"
-  ]
-}
+```toml
+[mcp_servers.antigravity_intercom]
+command = ".venv/Scripts/python.exe"
+args = [".agents/skills/antigravity-intercom/server.py"]
+cwd = "."
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+default_tools_approval_mode = "writes"
+
+[mcp_servers.antigravity_intercom.env]
+INTERCOM_RUNTIME = "codex"
+INTERCOM_ALLOWED_ATTACHMENT_ROOTS = ".intercom-share"
 ```
 
-> 💡 **Pairing Tokens Handle Encryption Automatically**: You no longer need to manually configure topics or secrets across machines. Agents generate and exchange `AGYPAIR-...` tokens dynamically.
+Change the command to `.venv/bin/python` on macOS or Linux. Trust the repository, restart Codex, and inspect `/mcp` or Settings > MCP servers. This local process does not need a separate OpenAI API key or login.
 
-### Step 4: Grant Auto-Approval Permissions (`config.json`)
-Add the tool permission grant to `~/.gemini/config/config.json`:
+Codex state is isolated by a hash of the repository path below `$CODEX_HOME/intercom/workspaces` (normally `~/.codex/intercom/workspaces`):
+
+```text
+<workspace-hash>/identity.json
+<workspace-hash>/intercom_pairings.json
+<workspace-hash>/intercom_pairings.lock
+<workspace-hash>/nostr_listener.pid
+<workspace-hash>/nostr_intercom_debug.log
+<workspace-hash>/seen_messages.json
+<workspace-hash>/inbox/<identity>/messages/*.json
+<workspace-hash>/inbox/<identity>/attachments/*
+```
+
+The listener queues inbound messages. It does not write private Codex task files and does not start, resume, or steer a Codex task.
+
+Message listing exposes metadata only. Reading and deleting a selected message are separate approval-gated calls. Under quota pressure, the oldest read envelopes and their locally managed attachments are removed atomically; unread messages remain protected from automatic retention.
+
+If the process or machine is forcibly terminated during retention, stop the listener and inspect `<workspace-hash>/transactions` before deleting anything. Tombstones there are same-volume recovery copies from an interrupted commit; protocol v1 does not yet replay a persistent crash journal automatically.
+
+## Google Antigravity
+
+Copy or link this skill folder into `~/.gemini/config/skills/antigravity-intercom`, then register the MCP server in `~/.gemini/config/mcp_config.json`:
 
 ```json
 {
-  "Action": "mcp",
-  "Target": "antigravity-intercom/*"
+  "mcpServers": {
+    "antigravity-intercom": {
+      "command": "python",
+      "args": [
+        "C:/Users/<username>/.gemini/config/skills/antigravity-intercom/server.py"
+      ]
+    }
+  }
 }
 ```
 
-### Step 5: Start / Reload MCP Server
-Reload the MCP server in your IDE. `server.py` will automatically spawn the background Nostr listener process `nostr_listener.py` on startup!
+Antigravity is the default runtime when `INTERCOM_RUNTIME` is absent. Its state remains under `~/.gemini/antigravity/brain`, and its existing conversation wakeup is preserved.
+
+## Runtime settings
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `INTERCOM_RUNTIME` | `antigravity` or `codex` | `antigravity` |
+| `INTERCOM_STATE_DIR` | Explicit state override; bypasses Codex workspace isolation | Runtime-specific |
+| `INTERCOM_WORKSPACE_ROOT` | Stable workspace identity source for Codex | Current working directory |
+| `INTERCOM_ALLOWED_ATTACHMENT_ROOTS` | Path-separator-delimited outbound roots for Codex | `.intercom-share` |
+| `INTERCOM_ALLOWED_RELAY_HOSTS` | Comma-delimited WSS relay host allowlist | Built-in relay hosts |
+| `INTERCOM_ALLOWED_BLOSSOM_HOSTS` | Comma-delimited HTTPS Blossom host allowlist | Built-in Blossom hosts |
+| `INTERCOM_MAX_ATTACHMENT_BYTES` | Maximum decompressed attachment size | 100 MiB |
+| `INTERCOM_MAX_COMPRESSED_ATTACHMENT_BYTES` | Maximum compressed/downloaded size | 50 MiB |
+| `INTERCOM_MAX_ENDPOINT_BYTES` | Combined message and attachment quota per endpoint | 256 MiB |
+| `INTERCOM_MAX_INBOX_MESSAGES` | Maximum inbox envelope count | 1000 |
+| `INTERCOM_MAX_LOG_BYTES` | Log rotation threshold | 5 MiB |
+| `INTERCOM_LOG_BACKUPS` | Rotated log files retained | 2 |
+| `INTERCOM_DISABLE_LISTENER` | Set to `1` for tests or manual listener control | Off |
+| `INTERCOM_WIRE_V2` | Set to `1` only when both peers support topic-authenticated v2 | Off |
+| `INTERCOM_ALLOW_LEGACY_PLAINTEXT` | Unsafe Antigravity-only migration mode; never honored by Codex | Off |
+
+Custom relay and Blossom allowlists replace the built-in host list. Only WSS/HTTPS port 443 is accepted. Do not allow loopback, private, or link-local endpoints.
+
+## Verification
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m py_compile .agents\skills\antigravity-intercom\runtime_adapter.py .agents\skills\antigravity-intercom\nostr_relay.py .agents\skills\antigravity-intercom\nostr_listener.py .agents\skills\antigravity-intercom\server.py
+```
+
+If the MCP server does not appear, verify the interpreter path, install `requirements.txt` into that interpreter, confirm that the project is trusted, and restart Codex.

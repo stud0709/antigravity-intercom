@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+.venv/
+.pytest_cache/
+.coverage

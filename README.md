@@ -1,121 +1,84 @@
-# Antigravity Intercom 📡
+# Antigravity Intercom
 
-[![Nostr Protocol](https://img.shields.io/badge/Nostr-NIP--16%20Ephemeral-purple.svg)](https://github.com/nostr-protocol/nips)
-[![Encryption: AES-256-GCM](https://img.shields.io/badge/Encryption-AES--256--GCM-green.svg)](https://en.wikipedia.org/wiki/Galois/Counter_Mode)
-[![MCP Server](https://img.shields.io/badge/FastMCP-Python-blue.svg)](https://github.com/jlowin/fastmcp)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Antigravity Intercom is a local MCP server and repository skill for encrypted agent-to-agent messaging over Nostr. It supports Google Antigravity and Codex without a hosted bridge service or a separate OpenAI API key.
 
-**Antigravity Intercom** is a cross-network, decentralized agent-to-agent communication skill and FastMCP server for Google Antigravity. It enables autonomous AI agents across different machines, networks, or local environments to securely discover each other, exchange structured findings, send files/transcripts, and trigger real-time recipient agent wakeups via Nostr relays with **AES-256-GCM End-to-End Encryption (E2EE)** and **self-contained Pairing Tokens**.
+## Capabilities
 
----
+- AES-256-GCM encryption for message bodies and attachment metadata.
+- Expiring `AGYPAIR-...` bearer tokens with a new 256-bit channel key.
+- WSS Nostr relay transport using ephemeral kind `20000` events.
+- Inline compressed attachments and client-side encrypted Blossom uploads.
+- Atomic registry writes, replay detection, log rotation, per-endpoint quotas, bounded downloads and decompression, and attachment path controls.
+- Antigravity delivery through its existing conversation wakeup mechanism.
+- A Codex-local, workspace-isolated inbox that remote messages cannot use to start or steer a Codex task automatically.
 
-## ✨ Features
+## Security boundaries
 
-- **🔒 End-to-End Encryption (AES-256-GCM E2EE)**: 100% of messages, metadata, and attachment references are cryptographically sealed. Relays and observers only see unreadable ciphertext blobs.
-- **🎫 Self-Contained Pairing Tokens with TTL**: One-step agent pairing (`AGYPAIR-...`). Bundles topic routing, 256-bit AES pre-shared keys (PSK), sender identity, and configurable Time-To-Live (TTL) expiration.
-- **🧹 Automatic Registry Pruning & Garbage Collection**: Automatically cleans up expired pairings and purges entries when a local conversation is deleted from the filesystem.
-- **💾 Persistent Pairings across Restarts**: Active pairing configurations are saved on disk (`intercom_pairings.json`) and automatically re-subscribed upon Antigravity restarts or reboots.
-- **⚡ Real-Time Cross-Network Intercom**: Asynchronous pub/sub over public or private Nostr relay pools (`damus.io`, `nos.lol`, `primal.net`).
-- **🛡️ Ephemeral Nostr Events (Kind 20000 / NIP-16)**: Messages are broadcast in real-time without persistent storage on relay databases, eliminating duplicate historical replays on startup.
-- **📦 Hybrid Attachment Pipeline**:
-  - *Small Files ($\le$ 45 KB compressed)*: Inline Gzip + Base64 transmission directly inside the encrypted Nostr event.
-  - *Large Files (> 45 KB)*: Client-side AES-256-GCM encryption uploaded to Blossom media servers with decryption keys shared only inside the encrypted Nostr payload.
-- **🤖 Automatic Agent Wakeup**: Background listeners catch inbound Nostr events, write recipient inbox envelopes, and trigger instant agent wakeups via gRPC (`language_server.exe agentapi send-message`).
-- **🔒 PID Locking & Single-Instance Protection**: Prevents duplicate background listeners across server restarts using process-level PID locking (`nostr_listener.pid`).
+Payloads are end-to-end encrypted and authenticated. Relay addresses, event timing, traffic volume, and the routing topic remain visible to relays and network observers. Kind `20000` asks relays not to retain events, but a relay can ignore that request.
 
----
+Pairing tokens contain the channel key and are bearer secrets. Transfer them only through a trusted channel. Anyone who obtains a valid token can decrypt and forge channel traffic until it expires or the pairing is revoked. This protocol does not yet provide forward secrecy; an X25519/HKDF ratchet requires a negotiated v2 protocol.
 
-## 📖 Installation & Setup
+On Windows, stored pairing keys are wrapped with DPAPI for the current user; legacy plaintext registry entries are migrated atomically on first load. Other platforms rely on the state directory's operating-system permissions. Inbox bodies remain local plaintext and are subject to quota limits, so protect the operating-system account and profile directory. Oldest read messages and their managed attachments are pruned only when quota pressure requires space; unread messages are never pruned automatically.
 
-### 1. Prerequisites & Dependencies
-Ensure Python 3.10+ is installed:
-```bash
-pip install fastmcp nostr-sdk cryptography
-```
+Quota retention uses same-volume staging and reversible tombstones for ordinary errors, shutdown interrupts, and concurrent delivery. An uncatchable process kill or power loss during the final filesystem moves can leave recovery data below the workspace state's `transactions` directory. Do not delete such a directory until its contents have been inspected and recovered; automatic crash-journal recovery is not part of protocol v1.
 
-### 2. Install Skill
-Link or copy `.agents/skills/antigravity-intercom` to your global Antigravity skills directory:
+Unpaired sends fail closed. Codex never accepts the optional legacy plaintext mode. Inbox listing is metadata-only; reading one selected body is a separate, approval-gated tool call. Remote content remains untrusted even after decryption.
+
+## Install
+
+Python 3.10 or newer is required.
+
 ```powershell
-# Windows PowerShell Example
-New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.gemini\config\skills\antigravity-intercom" -Target "C:\path\to\antigravity-intercom\.agents\skills\antigravity-intercom"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-### 3. Register MCP Server (`mcp_config.json`)
-Add `antigravity-intercom` to your `mcp_config.json` (located at `~/.gemini/config/mcp_config.json`):
+### Codex
 
-```json
-"antigravity-intercom": {
-  "command": "python",
-  "args": [
-    "C:/Users/<username>/.gemini/config/skills/antigravity-intercom/server.py"
-  ]
-}
-```
+The repository includes a project-scoped [`.codex/config.toml`](.codex/config.toml). Open the repository as a trusted Codex project and restart Codex after creating `.venv`.
 
-### 4. Auto-Approval Permissions (`config.json`)
-Grant MCP tool permission in `~/.gemini/config/config.json`:
-```json
-{
-  "Action": "mcp",
-  "Target": "antigravity-intercom/*"
-}
-```
+The committed interpreter path targets Windows. On macOS or Linux, change `command` to `.venv/bin/python`. Codex discovers the skill from `.agents/skills/antigravity-intercom` and exposes:
 
----
+- `intercom_get_local_identity`
+- `intercom_generate_pairing_token`
+- `intercom_pair`
+- `intercom_list_pairings`
+- `intercom_unpair`
+- `intercom_nostr_send_message`
+- `intercom_receive_messages`
+- `intercom_read_message`
+- `intercom_delete_message`
 
-## 🚀 Usage & Protocol
+Codex first lists inbox metadata, then reads a selected message ID. Automatic wakeup of the open Codex task is intentionally absent because a local MCP server must not inject unsolicited turns.
 
-### 1. Pairing Conversations (First-Time Setup)
+Codex outbound attachments are restricted to `.intercom-share` by default. Copy only intended files into that ignored folder before sending them.
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant AgentA as Agent A (Machine 1)
-    participant Relay as Nostr Relay
-    participant AgentB as Agent B (Machine 2)
+### Google Antigravity
 
-    User->>AgentA: "Create pairing token valid for 24h"
-    AgentA->>AgentA: Calls intercom_generate_pairing_token(ttl_hours=24)
-    AgentA-->>User: Returns AGYPAIR-... token
-    
-    User->>AgentB: "Connect using token AGYPAIR-..."
-    AgentB->>AgentB: Calls intercom_pair(pairing_token="AGYPAIR-...")
-    AgentB->>Relay: Sends Encrypted Handshake
-    Relay->>AgentA: Delivers Handshake (Both Paired!)
-```
+Antigravity remains the default runtime and keeps its existing wakeup behavior. See [the setup guide](.agents/skills/antigravity-intercom/SETUP.md) for MCP registration.
 
-1. **Initiator Agent**:
-   ```python
-   intercom_generate_pairing_token(
-       sender_conversation_id="my_conversation_id",
-       recipient_hint="Remote Agent Name",
-       ttl_hours=24.0 # Optional TTL in hours (defaults to 24)
-   )
-   ```
-2. **Acceptor Agent**:
-   ```python
-   intercom_pair(
-       pairing_token="AGYPAIR-eyJ2IjogMSwgInRvcGljIjogImFneV8...",
-       my_conversation_id="my_conversation_id"
-   )
-   ```
+## Pair and send
 
----
+1. In Codex, call `intercom_get_local_identity`. In Antigravity, use the active conversation ID.
+2. The initiating endpoint generates a short-lived token. Use `ttl_hours=0` only when both users explicitly approve a permanent pairing.
+3. Transfer the complete token through a trusted channel. The receiving endpoint calls `intercom_pair`; permanent tokens additionally require `allow_permanent=true`.
+4. Use the remote ID returned by pairing as `recipient_conversation_id` when sending.
+5. Revoke a local channel with `intercom_unpair` when collaboration ends.
 
-### 2. End-to-End Encrypted Messaging
+Example:
 
-Once paired, agents use `intercom_nostr_send_message` with automated E2EE encryption:
-
-```python
+```text
 intercom_nostr_send_message(
-    sender_conversation_id="9dcbdfd5-b7ed-4b4d-8c40-d06afdaac628",
-    recipient_conversation_id="55625e1d-f7b9-480b-a367-36bad4e12dd3",
-    content="Here is the diagnostic report.",
-    attachment_path="C:/path/to/report.pdf" # Optional file attachment
+  sender_conversation_id="codex_...",
+  recipient_conversation_id="remote-id",
+  content="Diagnostic report is ready.",
+  attachment_path=".intercom-share/report.pdf"
 )
 ```
 
----
+## Compatibility
 
-## 📄 License
-MIT License. Free for open source and agentic AI integration.
+The default ciphertext remains compatible with existing v1 Antigravity Intercom peers. Set `INTERCOM_WIRE_V2=1` only when both peers support topic-authenticated v2 ciphertext. New 128-bit topics remain consumable by legacy peers that do not impose a 64-bit topic length check.
+
+See [SETUP.md](.agents/skills/antigravity-intercom/SETUP.md) for runtime settings and troubleshooting.
