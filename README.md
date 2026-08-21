@@ -1,21 +1,26 @@
 # Antigravity Intercom 📡
 
 [![Nostr Protocol](https://img.shields.io/badge/Nostr-NIP--16%20Ephemeral-purple.svg)](https://github.com/nostr-protocol/nips)
+[![Encryption: AES-256-GCM](https://img.shields.io/badge/Encryption-AES--256--GCM-green.svg)](https://en.wikipedia.org/wiki/Galois/Counter_Mode)
 [![MCP Server](https://img.shields.io/badge/FastMCP-Python-blue.svg)](https://github.com/jlowin/fastmcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Antigravity Intercom** is a cross-network, decentralized agent-to-agent communication skill and FastMCP server for Google Antigravity. It enables autonomous AI agents across different machines, networks, or local environments to discover each other, exchange structured findings, send files/transcripts, and trigger real-time recipient agent wakeups via Nostr relays.
+**Antigravity Intercom** is a cross-network, decentralized agent-to-agent communication skill and FastMCP server for Google Antigravity. It enables autonomous AI agents across different machines, networks, or local environments to securely discover each other, exchange structured findings, send files/transcripts, and trigger real-time recipient agent wakeups via Nostr relays with **AES-256-GCM End-to-End Encryption (E2EE)** and **self-contained Pairing Tokens**.
 
 ---
 
 ## ✨ Features
 
-- **⚡ Real-Time Cross-Network Intercom**: Enables agents on different networks/machines to communicate asynchronously over public or private Nostr relay pools (`damus.io`, `nos.lol`, `primal.net`).
+- **🔒 End-to-End Encryption (AES-256-GCM E2EE)**: 100% of messages, metadata, and attachment references are cryptographically sealed. Relays and observers only see unreadable ciphertext blobs.
+- **🎫 Self-Contained Pairing Tokens**: One-step agent pairing (`AGYPAIR-...`). Bundles topic routing, 256-bit AES pre-shared keys (PSK), and sender identity into a single token.
+- **💾 Persistent Pairings across Restarts**: Pairing configurations are saved on disk (`intercom_pairings.json`) and automatically re-subscribed upon Antigravity restarts or reboots.
+- **⚡ Real-Time Cross-Network Intercom**: Asynchronous pub/sub over public or private Nostr relay pools (`damus.io`, `nos.lol`, `primal.net`).
 - **🛡️ Ephemeral Nostr Events (Kind 20000 / NIP-16)**: Messages are broadcast in real-time without persistent storage on relay databases, eliminating duplicate historical replays on startup.
-- **📦 Native Gzip + Base64 Attachments**: Large text files, code diffs, logs, and `transcript.jsonl` files are automatically compressed with Gzip (~90% compression ratio), Base64-encoded, and embedded into Nostr events. No external HTTP web hosts or API keys required!
+- **📦 Hybrid Attachment Pipeline**:
+  - *Small Files ($\le$ 45 KB compressed)*: Inline Gzip + Base64 transmission directly inside the encrypted Nostr event.
+  - *Large Files (> 45 KB)*: Client-side AES-256-GCM encryption uploaded to Blossom media servers with decryption keys shared only inside the encrypted Nostr payload.
 - **🤖 Automatic Agent Wakeup**: Background listeners catch inbound Nostr events, write recipient inbox envelopes, and trigger instant agent wakeups via gRPC (`language_server.exe agentapi send-message`).
 - **🔒 PID Locking & Single-Instance Protection**: Prevents duplicate background listeners across server restarts using process-level PID locking (`nostr_listener.pid`).
-- **🛠️ Self-Healing Path Resolution**: Automatically heals common file path typos (e.g. username space variations) when attaching files.
 
 ---
 
@@ -24,12 +29,12 @@
 ### 1. Prerequisites & Dependencies
 Ensure Python 3.10+ is installed:
 ```bash
-pip install fastmcp nostr-sdk
+pip install fastmcp nostr-sdk cryptography
 ```
 
 ### 2. Install Skill
 Link or copy `.agents/skills/antigravity-intercom` to your global Antigravity skills directory:
-```bash
+```powershell
 # Windows PowerShell Example
 New-Item -ItemType SymbolicLink -Path "$env:USERPROFILE\.gemini\config\skills\antigravity-intercom" -Target "C:\path\to\antigravity-intercom\.agents\skills\antigravity-intercom"
 ```
@@ -42,14 +47,9 @@ Add `antigravity-intercom` to your `mcp_config.json` (located at `~/.gemini/conf
   "command": "python",
   "args": [
     "C:/Users/<username>/.gemini/config/skills/antigravity-intercom/server.py"
-  ],
-  "env": {
-    "ANTIGRAVITY_INTERCOM_TOPIC": "234af7d3-8b40-4023-949a-e27bd39bfe11"
-  }
+  ]
 }
 ```
-
-> 💡 **Note**: All participating agent machines must share the same `ANTIGRAVITY_INTERCOM_TOPIC` UUID to communicate on the same Nostr relay channel.
 
 ### 4. Auto-Approval Permissions (`config.json`)
 Grant MCP tool permission in `~/.gemini/config/config.json`:
@@ -62,26 +62,56 @@ Grant MCP tool permission in `~/.gemini/config/config.json`:
 
 ---
 
-## 🚀 Usage
+## 🚀 Usage & Protocol
 
-### Calling the MCP Tool
-Agents call the `intercom_nostr_send_message` tool provided by the server:
+### 1. Pairing Conversations (First-Time Setup)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant AgentA as Agent A (Machine 1)
+    participant Relay as Nostr Relay
+    participant AgentB as Agent B (Machine 2)
+
+    User->>AgentA: "Create pairing token for Agent B"
+    AgentA->>AgentA: Calls intercom_generate_pairing_token()
+    AgentA-->>User: Returns AGYPAIR-... token
+    
+    User->>AgentB: "Connect using token AGYPAIR-..."
+    AgentB->>AgentB: Calls intercom_pair(pairing_token="AGYPAIR-...")
+    AgentB->>Relay: Sends Encrypted Handshake
+    Relay->>AgentA: Delivers Handshake (Both Paired!)
+```
+
+1. **Initiator Agent**:
+   ```python
+   intercom_generate_pairing_token(
+       sender_conversation_id="my_conversation_id",
+       recipient_hint="Remote Agent Name"
+   )
+   ```
+2. **Acceptor Agent**:
+   ```python
+   intercom_pair(
+       pairing_token="AGYPAIR-eyJ2IjogMSwgInRvcGljIjogImFneV8...",
+       my_conversation_id="my_conversation_id"
+   )
+   ```
+
+---
+
+### 2. End-to-End Encrypted Messaging
+
+Once paired, agents use `intercom_nostr_send_message` with automated E2EE encryption:
 
 ```python
 intercom_nostr_send_message(
     sender_conversation_id="9dcbdfd5-b7ed-4b4d-8c40-d06afdaac628",
     recipient_conversation_id="55625e1d-f7b9-480b-a367-36bad4e12dd3",
     content="Here is the diagnostic report.",
-    attachment_path="C:/path/to/transcript.jsonl" # Optional file attachment
+    attachment_path="C:/path/to/report.pdf" # Optional file attachment
 )
 ```
-
-### Inbound Message Handling
-When an agent receives a message delivered by the background listener:
-- **Standard Message**:
-  `message from conversation Y, use antigravity-intercom to answer: <content>`
-- **Message with Attachment**:
-  `message from conversation Y, use antigravity-intercom to answer: <content>. It contains attachment of type application/json, data.json downloaded into <brain_dir>/attachments/data.json`
 
 ---
 

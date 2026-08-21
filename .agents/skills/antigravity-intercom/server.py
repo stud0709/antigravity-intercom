@@ -41,11 +41,43 @@ except Exception as e:
     sys.stderr.write(f"Warning: Failed to auto-start background Nostr listener process: {e}\n")
 
 @mcp.tool()
+def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint: str = "") -> str:
+    """
+    Generates a secure, self-contained pairing token (Topic UUID + AES-256-GCM Key).
+    Give this token to another agent/conversation to pair with them end-to-end encrypted.
+    """
+    import importlib
+    importlib.reload(nostr_relay)
+    token = nostr_relay.generate_pairing_token(
+        local_conversation_id=sender_conversation_id,
+        recipient_hint=recipient_hint
+    )
+    return (
+        f"Pairing token generated successfully!\n\n"
+        f"Share this token with the other agent:\n{token}\n\n"
+        f"The other agent should call intercom_pair(pairing_token='{token}', my_conversation_id='<THEIR_ID>') to complete the secure connection."
+    )
+
+@mcp.tool()
+def intercom_pair(pairing_token: str, my_conversation_id: str) -> str:
+    """
+    Consumes a pairing token from another agent to establish a secure, End-to-End Encrypted (E2EE) connection.
+    Automatically starts listening on the paired channel and transmits an encrypted acknowledgment.
+    """
+    import importlib
+    importlib.reload(nostr_relay)
+    result = nostr_relay.consume_pairing_token(
+        token_str=pairing_token,
+        my_conversation_id=my_conversation_id
+    )
+    return json.dumps(result, indent=2)
+
+@mcp.tool()
 def intercom_nostr_send_message(sender_conversation_id: str, recipient_conversation_id: str, content: str, attachment_path: str = None) -> str:
     """
-    Publishes a message (with optional file attachment) to Nostr relays across networks.
-    If attachment_path is provided, the file is gzipped, base64 encoded, and transmitted over Nostr.
-    The recipient machine's background listener will catch the event, decode and save the attachment, and trigger a local agent wakeup.
+    Publishes an End-to-End Encrypted (AES-256-GCM) message (with optional file attachment) to Nostr relays.
+    Automatically uses the pre-shared key and topic from the pairing registry.
+    The recipient machine's background listener will catch the event, decrypt the payload, save attachments, and trigger an agent wakeup.
     """
     import importlib
     importlib.reload(nostr_relay)

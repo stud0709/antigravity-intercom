@@ -1,11 +1,11 @@
 ---
 name: antigravity-intercom
-description: Enables bidirectional agent communication and diagnostic synchronization across networks via Nostr relays.
+description: Enables bidirectional agent communication and diagnostic synchronization across networks via Nostr relays with End-to-End Encryption (E2EE) and Pairing Tokens.
 ---
 
 # Antigravity Intercom Skill
 
-This skill enables you to send diagnostic findings, project state, or questions to other agent conversations across networks, and process incoming messages from other agents in a discussion thread.
+This skill enables you to securely connect and communicate with other agent conversations across machines and networks using self-contained **Pairing Tokens** and **AES-256-GCM End-to-End Encryption (E2EE)** over Nostr relays.
 
 ---
 
@@ -16,22 +16,46 @@ For installation instructions on new machines or configuration details, see [SET
 
 ## 🛠️ Execution Protocol
 
-### 1. Sending Messages & Attachments (Nostr Relays)
-To send messages or findings to another conversation (e.g., conversation ID `X`):
+### 1. Connecting Conversations with a Pairing Token (First-Time Setup)
+
+To establish a secure, encrypted tunnel between two conversations:
+
+- **Step A (Initiator)**:
+  Call `intercom_generate_pairing_token` with:
+  - `sender_conversation_id`: Your own active conversation ID.
+  - `recipient_hint`: (Optional) Name or hint for the remote agent.
+  - *Returns*: An `AGYPAIR-...` token. Provide this token to the user to give to the other agent.
+
+- **Step B (Acceptor)**:
+  When given an `AGYPAIR-...` token from another conversation:
+  Call `intercom_pair` with:
+  - `pairing_token`: The `AGYPAIR-...` token string.
+  - `my_conversation_id`: Your own active conversation ID.
+  - *Result*: The connection is saved to your local registry (`intercom_pairings.json`), and an encrypted handshake is automatically sent to the remote agent.
+
+> 💡 **Pairings are persistent!** Once paired, the connection is retained across Antigravity restarts and machine reboots.
+
+---
+
+### 2. Sending Messages & Attachments (End-to-End Encrypted)
+
+To send messages or files to a paired conversation (e.g., conversation ID `X`):
 1. Call the `intercom_nostr_send_message` tool.
 2. Provide:
-   - `sender_conversation_id`: Your own active conversation ID (e.g. from context or environment `ANTIGRAVITY_CONVERSATION_ID`).
+   - `sender_conversation_id`: Your own active conversation ID.
    - `recipient_conversation_id`: The target conversation ID `X`.
    - `content`: The structured markdown report or questions you wish to transmit.
-   - `attachment_path`: (Optional) Absolute path to a local file or transcript (`.jsonl`, `.txt`, `.pdf`, etc.). The file will be gzipped, Base64-encoded, and embedded into the Nostr event.
+   - `attachment_path`: (Optional) Absolute path to a local file or transcript (`.jsonl`, `.txt`, `.pdf`, `.bin`, etc.). Small files are gzipped and sent inline; large files are encrypted with AES-256-GCM and stored on Blossom.
 
-### 2. Processing and Replying to Inbound Messages & Attachments
+---
+
+### 3. Processing and Replying to Inbound Messages & Attachments
+
 When you receive an inbox message delivered via the background Nostr listener:
-- Standard inbound format:
+- **Standard inbound format**:
   `message from conversation Y, use antigravity-intercom to answer: <the original message>`
-- Inbound message with attachment format:
+- **Inbound message with attachment format**:
   `message from conversation Y, use antigravity-intercom to answer: <the original message>. It contains attachment of type <mime_type>, <file_name> downloaded into <saved_file_path>`
-- If an attachment is included, you can inspect or read `<saved_file_path>` directly from your filesystem.
 - To reply, call `intercom_nostr_send_message` with:
    - `sender_conversation_id`: Your own active conversation ID.
    - `recipient_conversation_id`: The sender ID `Y` extracted from the message prefix.

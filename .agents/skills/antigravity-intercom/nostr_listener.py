@@ -42,10 +42,9 @@ def ensure_single_instance():
 
 def main():
     ensure_single_instance()
-    topic = nostr_relay.get_default_topic()
-    nostr_relay.log_debug(f"Starting Standalone Nostr Intercom Listener for topic '{topic}'...")
+    nostr_relay.log_debug("Starting Standalone Nostr Intercom Multi-Topic Listener...")
     
-    t = nostr_relay.start_background_nostr_listener(topic)
+    t = nostr_relay.start_background_nostr_listener()
     nostr_relay.log_debug("Listener thread started. Keeping main process active...")
     
     try:
