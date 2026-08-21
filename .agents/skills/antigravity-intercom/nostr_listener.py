@@ -46,7 +46,8 @@ def ensure_single_instance() -> bool:
                     try:
                         if sys.platform == "win32":
                             import subprocess
-                            subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], capture_output=True)
+                            no_win = subprocess.CREATE_NO_WINDOW
+                            subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], capture_output=True, creationflags=no_win)
                         else:
                             os.kill(old_pid, 9)
                         time.sleep(0.5)

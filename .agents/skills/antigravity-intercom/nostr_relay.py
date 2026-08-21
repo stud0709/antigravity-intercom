@@ -1407,12 +1407,11 @@ if ($proc) {
     if ($conn) {
         $port = $conn.LocalPort
     }
-    Write-Output "$port|$csrf"
-}"""
-        try:
+            no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             p = subprocess.run(
                 ["powershell.exe", "-ExecutionPolicy", "Bypass", "-Command", discover_script],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True,
+                creationflags=no_window
             )
             output = p.stdout.strip()
             parts = output.split("|")
@@ -1434,7 +1433,8 @@ if ($proc) {
             
             p_meta = subprocess.run(
                 [ls_path, "agentapi", "get-conversation-metadata", recipient_id],
-                env=env, capture_output=True, text=True, check=True
+                env=env, capture_output=True, text=True, check=True,
+                creationflags=no_window
             )
             meta_resp = json.loads(p_meta.stdout)
             project_id = meta_resp["response"]["conversationMetadata"]["metadata"]["projectId"]
@@ -1454,7 +1454,8 @@ if ($proc) {
             
             res = subprocess.run(
                 [ls_path, "agentapi", "send-message", recipient_id, formatted_content],
-                env=env_send, capture_output=True, text=True, check=True
+                env=env_send, capture_output=True, text=True, check=True,
+                creationflags=no_window
             )
             log_debug(f"[Nostr Intercom Listener] Wakeup delivered successfully for {recipient_id}: {res.stdout}")
         except Exception as e:
