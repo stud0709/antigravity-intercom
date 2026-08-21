@@ -44,7 +44,7 @@ except Exception as e:
 def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
     """
     Generates a secure, self-contained pairing token (Topic UUID + AES-256-GCM Key).
-    Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours).
+    Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours. Use 0 for permanent / no expiration).
     Give this token to another agent/conversation to pair with them end-to-end encrypted.
     """
     import importlib
@@ -54,8 +54,9 @@ def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint:
         recipient_hint=recipient_hint,
         ttl_hours=ttl_hours
     )
+    ttl_msg = f"valid for {ttl_hours} hours" if ttl_hours and ttl_hours > 0 else "permanent (no expiration)"
     return (
-        f"Pairing token generated successfully (valid for {ttl_hours} hours)!\n\n"
+        f"Pairing token generated successfully ({ttl_msg})!\n\n"
         f"Share this token with the other agent:\n{token}\n\n"
         f"The other agent should call intercom_pair(pairing_token='{token}', my_conversation_id='<THEIR_ID>') to complete the secure connection."
     )
