@@ -22,7 +22,7 @@ All active connections and encryption keys are stored persistently on disk in th
 - **Single Background Daemon**: A single `nostr_listener.py` daemon manages real-time event subscriptions across all paired topics on the machine.
 - **Restart Persistence**: All active pairings survive Antigravity IDE restarts and system reboots.
 - **Automatic Pruning & Garbage Collection**:
-  - **TTL Expiration**: Pairings automatically expire after their configured Time-To-Live (`ttl_hours`, default 24h).
+  - **TTL Expiration**: Pairings automatically expire after their configured Time-To-Live (`ttl_hours`, default 24h; permanent if `ttl_hours=0`).
   - **Deleted Conversation Cleanup**: When a local conversation folder is deleted from the filesystem, its associated pairing is automatically purged from the registry.
 
 ---
@@ -37,10 +37,14 @@ When the user asks you to connect, pair with, or talk to another agent:
 1. Call `intercom_generate_pairing_token`:
    - `sender_conversation_id`: Your active conversation ID (found in your conversation metadata or environment).
    - `recipient_hint`: (Optional) Name or alias for the remote agent (e.g. `"Backend Diagnostic Agent"`).
-   - `ttl_hours`: (Optional) Expiration period in hours (defaults to `24.0`). For temporary sessions, you can set `ttl_hours=2.0` or for long-lived collaboration `ttl_hours=168.0` (7 days).
+   - `ttl_hours`: (Optional) Expiration period in hours:
+     - **Omitted / Default**: `24.0` (valid for 24 hours).
+     - **Quick Diagnostic Session**: `2.0` (valid for 2 hours).
+     - **Sprint / Multi-Day Sync**: `168.0` (valid for 7 days).
+     - **Permanent / Never Expires**: `0` (or `0.0`, no expiration).
 2. The tool outputs a self-contained token string: `AGYPAIR-...`.
 3. Present the token to the user and instruct them to give it to the other agent:
-   > *"Here is your pairing token (valid for X hours): `AGYPAIR-...`. Please provide this to the other agent to complete the secure connection."*
+   > *"Here is your pairing token: `AGYPAIR-...`. Please provide this to the other agent to complete the secure connection."*
 
 #### Scenario B: The User Gives You a Pairing Token (`AGYPAIR-...`)
 1. Call `intercom_pair`:
