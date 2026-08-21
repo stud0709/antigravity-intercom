@@ -42,11 +42,16 @@ def ensure_single_instance() -> bool:
                 with open(pid_file, "r", encoding="utf-8") as handle:
                     content = handle.read().strip()
                 old_pid = int(content) if content.isdigit() else 0
-                if _process_exists(old_pid):
-                    nostr_relay.log_debug(
-                        f"[SingleInstance] Listener PID {old_pid} is already active."
-                    )
-                    return False
+                if _process_exists(old_pid) and old_pid != current_pid:
+                    try:
+                        if sys.platform == "win32":
+                            import subprocess
+                            subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], capture_output=True)
+                        else:
+                            os.kill(old_pid, 9)
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
                 os.unlink(pid_file)
                 continue
             except OSError as exc:

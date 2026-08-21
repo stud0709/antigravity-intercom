@@ -1165,40 +1165,59 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
 
             pairings_data = load_pairings()
             topic_info = pairings_data.get("topics", {}).get(sanitize_topic(event_topic), {})
-            expected_local_id = topic_info.get("local_conversation_id")
-            if not expected_local_id:
-                local_candidates = {
-                    pairing.get("local_conversation_id")
-                    for pairing in pairings_data.get("pairings", {}).values()
-                    if sanitize_topic(pairing.get("topic", ""))
-                    == sanitize_topic(event_topic)
-                    and pairing.get("local_conversation_id")
-                }
-                if len(local_candidates) == 1:
-                    expected_local_id = next(iter(local_candidates))
-            if not expected_local_id:
+            
+            # Find all local endpoints that have this topic registered
+            valid_local_recipients = set()
+            if topic_info.get("local_conversation_id"):
+                valid_local_recipients.add(topic_info.get("local_conversation_id"))
+            if topic_info.get("remote_conversation_id") and runtime_adapter.conversation_exists(topic_info.get("remote_conversation_id")):
+                valid_local_recipients.add(topic_info.get("remote_conversation_id"))
+                
+            valid_senders = set()
+            if topic_info.get("remote_conversation_id"):
+                valid_senders.add(topic_info.get("remote_conversation_id"))
+            if topic_info.get("local_conversation_id"):
+                valid_senders.add(topic_info.get("local_conversation_id"))
+
+            for pairing in pairings_data.get("pairings", {}).values():
+                if sanitize_topic(pairing.get("topic", "")) == sanitize_topic(event_topic):
+                    loc = pairing.get("local_conversation_id")
+                    rem = pairing.get("remote_conversation_id")
+                    if loc:
+                        valid_local_recipients.add(loc)
+                        valid_senders.add(loc)
+                    if rem:
+                        valid_senders.add(rem)
+                        if runtime_adapter.conversation_exists(rem):
+                            valid_local_recipients.add(rem)
+
+            if not valid_local_recipients:
                 log_debug(
                     f"[Nostr Intercom Listener] Topic '{event_topic}' has no local binding. Ignoring."
                 )
                 return
-            if recipient_id != expected_local_id:
+                
+            if recipient_id not in valid_local_recipients:
                 log_debug(
                     f"[Nostr Intercom Listener] Authenticated payload targets '{recipient_id}', "
-                    f"but topic is bound to '{expected_local_id}'. Ignoring."
+                    f"which is not in valid local recipients {valid_local_recipients} for topic '{event_topic}'. Ignoring."
                 )
                 return
 
-            expected_remote_id = topic_info.get("remote_conversation_id", "")
-            if expected_remote_id.startswith("pending_"):
-                if msg_type != "handshake":
+            has_pending = any(s.startswith("pending_") for s in valid_senders)
+            if has_pending and msg_type == "handshake":
+                # Handshake from any sender completing pairing is allowed
+                pass
+            elif valid_senders and not any(s.startswith("pending_") for s in valid_senders):
+                if sender_id not in valid_senders:
                     log_debug(
-                        "[Nostr Intercom Listener] Pending pairing accepts only a handshake."
+                        f"[Nostr Intercom Listener] Authenticated sender '{sender_id}' does not "
+                        f"match paired peers {valid_senders}. Ignoring."
                     )
                     return
-            elif expected_remote_id and sender_id != expected_remote_id:
+            elif has_pending and msg_type != "handshake" and sender_id not in valid_senders:
                 log_debug(
-                    f"[Nostr Intercom Listener] Authenticated sender '{sender_id}' does not "
-                    f"match paired peer '{expected_remote_id}'. Ignoring."
+                    "[Nostr Intercom Listener] Pending pairing accepts only a handshake."
                 )
                 return
 
