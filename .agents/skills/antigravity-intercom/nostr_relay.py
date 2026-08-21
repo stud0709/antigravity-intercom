@@ -1407,6 +1407,9 @@ if ($proc) {
     if ($conn) {
         $port = $conn.LocalPort
     }
+    Write-Output "$port|$csrf"
+}"""
+        try:
             no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             p = subprocess.run(
                 ["powershell.exe", "-ExecutionPolicy", "Bypass", "-Command", discover_script],
