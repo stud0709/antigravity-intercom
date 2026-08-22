@@ -412,11 +412,12 @@ def save_pairing(remote_conversation_id: str, topic: str, psk_b64: str, local_co
         if expires_at:
             pairing_entry["expires_at"] = expires_at
             
-        # A topic represents one peer-to-peer channel. Replace the pending or
-        # aliased placeholder once the encrypted handshake reveals the peer ID.
+        # Only replace pending or alias placeholders once the peer ID is known.
+        # Do not evict valid paired conversations that share the same topic channel.
         for existing_id, existing in list(data["pairings"].items()):
             if existing_id != remote_conversation_id and existing.get("topic") == topic:
-                data["pairings"].pop(existing_id, None)
+                if existing_id.startswith("pending_") or (alias and existing_id == alias):
+                    data["pairings"].pop(existing_id, None)
 
         data["pairings"][remote_conversation_id] = pairing_entry
         
@@ -438,9 +439,30 @@ def save_pairing(remote_conversation_id: str, topic: str, psk_b64: str, local_co
         ttl_info = f" (Expires at {expires_at})" if expires_at else ""
         log_debug(f"[Pairings] Saved pairing for recipient '{remote_conversation_id}' on topic '{topic}'{ttl_info}")
 
-def get_pairing_for_recipient(recipient_id: str) -> dict:
+def get_pairing_for_recipient(recipient_id: str, sender_id: str = "") -> dict:
     data = load_pairings()
-    return data.get("pairings", {}).get(recipient_id)
+    pairings = data.get("pairings", {})
+    
+    # 1. Direct lookup by recipient_id
+    if recipient_id in pairings:
+        p = pairings[recipient_id]
+        if not sender_id or p.get("local_conversation_id") == sender_id or not p.get("local_conversation_id"):
+            return p
+            
+    # 2. Lookup matching (local=sender_id, remote=recipient_id) or reverse pair
+    for p in pairings.values():
+        if p.get("remote_conversation_id") == recipient_id:
+            if not sender_id or p.get("local_conversation_id") == sender_id:
+                return p
+        if sender_id and p.get("local_conversation_id") == recipient_id and p.get("remote_conversation_id") == sender_id:
+            return p
+            
+    # 3. Topic fallback lookup
+    for t in data.get("topics", {}).values():
+        if t.get("remote_conversation_id") == recipient_id or t.get("local_conversation_id") == recipient_id:
+            return t
+            
+    return None
 
 
 def delete_pairing(recipient_id: str) -> bool:
@@ -893,7 +915,7 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
         )
     relay_urls = _validate_relay_urls(relay_urls)
     # Check if a pairing exists for recipient
-    pairing = get_pairing_for_recipient(recipient_conversation_id)
+    pairing = get_pairing_for_recipient(recipient_conversation_id, sender_conversation_id)
     psk_bytes = None
     
     if pairing:
