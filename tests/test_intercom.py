@@ -34,6 +34,7 @@ except ModuleNotFoundError:
 
 import nostr_relay
 import runtime_adapter
+import server
 
 
 class IsolatedStateTestCase(unittest.TestCase):
@@ -764,6 +765,90 @@ class CryptoAndPairingTests(IsolatedStateTestCase):
         )
         self.assertTrue(nostr_relay.delete_pairing("remote"))
         self.assertEqual(nostr_relay.load_pairings(), {"pairings": {}, "topics": {}})
+
+    def test_unpair_scoped_to_local_conversation(self):
+        nostr_relay.save_pairing(
+            "remote_1",
+            "agy_0000000000000001",
+            base64.b64encode(os.urandom(32)).decode("ascii"),
+            "local_1",
+        )
+        nostr_relay.save_pairing(
+            "remote_2",
+            "agy_0000000000000002",
+            base64.b64encode(os.urandom(32)).decode("ascii"),
+            "local_2",
+        )
+        # Attempt to delete remote_1 as local_2 should fail
+        self.assertFalse(
+            nostr_relay.delete_pairing("remote_1", local_conversation_id="local_2")
+        )
+        pairings = nostr_relay.load_pairings()["pairings"]
+        self.assertIn("remote_1", pairings)
+        self.assertIn("remote_2", pairings)
+
+        # Deleting remote_1 as local_1 succeeds
+        self.assertTrue(
+            nostr_relay.delete_pairing("remote_1", local_conversation_id="local_1")
+        )
+        pairings = nostr_relay.load_pairings()["pairings"]
+        self.assertNotIn("remote_1", pairings)
+        self.assertIn("remote_2", pairings)
+
+    def test_get_pairing_for_recipient_strictly_scopes_sender(self):
+        nostr_relay.save_pairing(
+            "remote_1",
+            "agy_0000000000000001",
+            base64.b64encode(os.urandom(32)).decode("ascii"),
+            "local_1",
+        )
+        # Mismatched sender cannot access remote_1's pairing
+        self.assertIsNone(
+            nostr_relay.get_pairing_for_recipient("remote_1", sender_id="local_2")
+        )
+        # Matching sender accesses remote_1's pairing
+        pairing = nostr_relay.get_pairing_for_recipient(
+            "remote_1", sender_id="local_1"
+        )
+        self.assertIsNotNone(pairing)
+        self.assertEqual(pairing["remote_conversation_id"], "remote_1")
+
+    def test_server_intercom_list_pairings_and_unpair_are_scoped(self):
+        os.environ["INTERCOM_RUNTIME"] = "antigravity"
+        nostr_relay.save_pairing(
+            "remote_1",
+            "agy_0000000000000001",
+            base64.b64encode(os.urandom(32)).decode("ascii"),
+            "test_local_1",
+        )
+        nostr_relay.save_pairing(
+            "remote_2",
+            "agy_0000000000000002",
+            base64.b64encode(os.urandom(32)).decode("ascii"),
+            "test_local_2",
+        )
+
+        res1 = json.loads(server.intercom_list_pairings("test_local_1"))
+        self.assertEqual(
+            [p["remote_conversation_id"] for p in res1["pairings"]], ["remote_1"]
+        )
+        self.assertEqual(res1["local_conversation_id"], "test_local_1")
+
+        res2 = json.loads(server.intercom_list_pairings("test_local_2"))
+        self.assertEqual(
+            [p["remote_conversation_id"] for p in res2["pairings"]], ["remote_2"]
+        )
+        self.assertEqual(res2["local_conversation_id"], "test_local_2")
+
+        unp1 = json.loads(
+            server.intercom_unpair("remote_1", local_conversation_id="test_local_2")
+        )
+        self.assertEqual(unp1["status"], "not_found")
+
+        unp2 = json.loads(
+            server.intercom_unpair("remote_1", local_conversation_id="test_local_1")
+        )
+        self.assertEqual(unp2["status"], "unpaired")
 
 
 class TransportAndAttachmentTests(IsolatedStateTestCase):

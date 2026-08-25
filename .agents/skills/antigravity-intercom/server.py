@@ -111,11 +111,14 @@ def intercom_nostr_send_message(sender_conversation_id: str, recipient_conversat
 
 
 @mcp.tool()
-def intercom_list_pairings() -> str:
-    """Lists active pairing metadata without returning encryption keys."""
+def intercom_list_pairings(local_conversation_id: str = "") -> str:
+    """Lists active pairing metadata for this conversation without returning encryption keys."""
+    effective_local_id = _local_identity_or(local_conversation_id)
     data = nostr_relay.load_pairings()
     pairings = []
     for pairing in data.get("pairings", {}).values():
+        if pairing.get("local_conversation_id") != effective_local_id:
+            continue
         pairings.append(
             {
                 key: pairing.get(key)
@@ -130,17 +133,30 @@ def intercom_list_pairings() -> str:
                 if pairing.get(key) is not None
             }
         )
-    return json.dumps({"runtime": runtime_adapter.get_runtime(), "pairings": pairings}, indent=2)
+    return json.dumps(
+        {
+            "runtime": runtime_adapter.get_runtime(),
+            "local_conversation_id": effective_local_id,
+            "pairings": pairings,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
-def intercom_unpair(recipient_conversation_id: str) -> str:
+def intercom_unpair(
+    recipient_conversation_id: str, local_conversation_id: str = ""
+) -> str:
     """Revokes and removes the local pairing for one remote endpoint."""
-    removed = nostr_relay.delete_pairing(recipient_conversation_id)
+    effective_local_id = _local_identity_or(local_conversation_id)
+    removed = nostr_relay.delete_pairing(
+        recipient_conversation_id, local_conversation_id=effective_local_id
+    )
     return json.dumps(
         {
             "status": "unpaired" if removed else "not_found",
             "recipient_conversation_id": recipient_conversation_id,
+            "local_conversation_id": effective_local_id,
         },
         indent=2,
     )

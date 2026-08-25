@@ -38,14 +38,14 @@ When given a token:
 1. Call `intercom_pair` with the token and local ID.
 2. For a token without an expiration, set `allow_permanent=true` only after explicit user approval.
 3. Report the remote endpoint ID and expiration returned by the tool.
-4. Use `intercom_list_pairings` to confirm metadata without exposing keys.
+4. Use `intercom_list_pairings` (with the local conversation ID in Antigravity) to confirm active pairing metadata for this conversation without exposing keys.
 5. After successful consumption, start the active Codex watch described below for the first message from that peer.
 
 For every created or consumed token, the local background listener continuously covers all registered, unexpired pairing topics and refreshes them every 10 seconds until `expires_at`. This listener-side monitoring is model-free and queues inbound messages; it must not wake, start, resume, or steer a Codex task.
 
 During the same active Codex turn, call `intercom_receive_messages` with `wait_seconds=10` repeatedly for up to 30 minutes, stopping after the expected handshake or first standard message is displayed. Do not keep a Codex reasoning turn open for the token's full lifetime. On every later user-activated Intercom turn, check unread metadata first and directly display authorized queued content before other Intercom work.
 
-Use `intercom_unpair` to revoke the local channel when asked or when the collaboration is complete.
+Use `intercom_unpair` (with the local conversation ID in Antigravity) to revoke the local channel when asked or when the collaboration is complete.
 
 ## Send
 

@@ -446,7 +446,7 @@ def get_pairing_for_recipient(recipient_id: str, sender_id: str = "") -> dict:
     # 1. Direct lookup by recipient_id
     if recipient_id in pairings:
         p = pairings[recipient_id]
-        if not sender_id or p.get("local_conversation_id") == sender_id or not p.get("local_conversation_id"):
+        if not sender_id or p.get("local_conversation_id") == sender_id:
             return p
             
     # 2. Lookup matching (local=sender_id, remote=recipient_id) or reverse pair
@@ -458,15 +458,25 @@ def get_pairing_for_recipient(recipient_id: str, sender_id: str = "") -> dict:
             return p
             
     # 3. Topic fallback lookup
-    for t in data.get("topics", {}).values():
-        if t.get("remote_conversation_id") == recipient_id or t.get("local_conversation_id") == recipient_id:
-            return t
+    if not sender_id:
+        for t in data.get("topics", {}).values():
+            if t.get("remote_conversation_id") == recipient_id or t.get("local_conversation_id") == recipient_id:
+                return t
+    else:
+        for t in data.get("topics", {}).values():
+            if (t.get("remote_conversation_id") == recipient_id and t.get("local_conversation_id") == sender_id) or \
+               (t.get("local_conversation_id") == recipient_id and t.get("remote_conversation_id") == sender_id):
+                return t
             
     return None
 
 
-def delete_pairing(recipient_id: str) -> bool:
+def delete_pairing(recipient_id: str, local_conversation_id: str = "") -> bool:
     recipient_id = runtime_adapter.validate_identity(recipient_id, "recipient_id")
+    if local_conversation_id:
+        local_conversation_id = runtime_adapter.validate_identity(
+            local_conversation_id, "local_conversation_id"
+        )
     with PAIRINGS_LOCK, runtime_adapter.registry_lock():
         file_path = get_pairings_file_path()
         if not os.path.exists(file_path):
@@ -477,13 +487,39 @@ def delete_pairing(recipient_id: str) -> bool:
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError("Pairing registry is unreadable.") from exc
 
-        removed = data.setdefault("pairings", {}).pop(recipient_id, None)
+        pairings = data.get("pairings", {})
+        target_key = None
+        target_entry = None
+        if recipient_id in pairings:
+            target_key = recipient_id
+            target_entry = pairings[recipient_id]
+        else:
+            for k, p in pairings.items():
+                if p.get("remote_conversation_id") == recipient_id:
+                    target_key = k
+                    target_entry = p
+                    break
+
+        if not target_entry or not target_key:
+            return False
+
+        if (
+            local_conversation_id
+            and target_entry.get("local_conversation_id")
+            and target_entry.get("local_conversation_id") != local_conversation_id
+        ):
+            log_debug(
+                f"[Pairings] Refusing to delete pairing '{recipient_id}' not owned by '{local_conversation_id}'."
+            )
+            return False
+
+        removed = data.setdefault("pairings", {}).pop(target_key, None)
         if not removed:
             return False
         topic = removed.get("topic")
         topic_still_used = any(
             pairing.get("topic") == topic
-            for pairing in data["pairings"].values()
+            for pairing in data.get("pairings", {}).values()
         )
         if topic and not topic_still_used:
             data.setdefault("topics", {}).pop(topic, None)
