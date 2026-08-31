@@ -75,6 +75,7 @@ def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint:
     Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours. Use 0 for permanent / no expiration).
     Give this token to another agent/conversation to pair with them end-to-end encrypted.
     """
+    _start_background_listener()
     sender_conversation_id = _require_conversation_identity(sender_conversation_id, "sender_conversation_id")
     token = nostr_relay.generate_pairing_token(
         local_conversation_id=sender_conversation_id,
@@ -97,6 +98,7 @@ def intercom_pair(
     Consumes a pairing token from another agent to establish a secure, End-to-End Encrypted (E2EE) connection.
     Automatically starts listening on the paired channel and transmits an encrypted acknowledgment.
     """
+    _start_background_listener()
     my_conversation_id = _require_conversation_identity(my_conversation_id, "my_conversation_id")
     result = nostr_relay.consume_pairing_token(
         token_str=pairing_token,
@@ -112,6 +114,7 @@ def intercom_nostr_send_message(sender_conversation_id: str, recipient_conversat
     Automatically uses the pre-shared key and topic from the pairing registry.
     The recipient machine's background listener will catch the event, decrypt the payload, save attachments, and trigger an agent wakeup.
     """
+    _start_background_listener()
     sender_conversation_id = _require_conversation_identity(sender_conversation_id, "sender_conversation_id")
     return nostr_relay.publish_nostr_intercom_message(
         sender_conversation_id=sender_conversation_id,
