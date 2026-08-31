@@ -75,10 +75,10 @@ Antigravity is the default runtime when `INTERCOM_RUNTIME` is absent. Its state 
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `INTERCOM_RUNTIME` | `antigravity` or `codex` | `antigravity` |
-| `INTERCOM_STATE_DIR` | Explicit state override; bypasses Codex workspace isolation | Runtime-specific |
-| `INTERCOM_WORKSPACE_ROOT` | Stable workspace identity source for Codex | Current working directory |
-| `INTERCOM_ALLOWED_ATTACHMENT_ROOTS` | Path-separator-delimited outbound roots for Codex | `.intercom-share` |
+| `INTERCOM_RUNTIME` | `antigravity` (push) or any other value e.g. `codex`, `cursor`, `standard`, `generic` (universal pull inbox) | `antigravity` |
+| `INTERCOM_STATE_DIR` | Explicit state override; bypasses workspace directory isolation | Runtime-specific |
+| `INTERCOM_WORKSPACE_ROOT` | Stable workspace identity source for standard MCP runtimes | Current working directory |
+| `INTERCOM_ALLOWED_ATTACHMENT_ROOTS` | Path-separator-delimited outbound roots for standard MCP runtimes | `.intercom-share` |
 | `INTERCOM_ALLOWED_RELAY_HOSTS` | Comma-delimited WSS relay host allowlist | Built-in relay hosts |
 | `INTERCOM_ALLOWED_BLOSSOM_HOSTS` | Comma-delimited HTTPS Blossom host allowlist | Built-in Blossom hosts |
 | `INTERCOM_MAX_ATTACHMENT_BYTES` | Maximum decompressed attachment size | 100 MiB |
@@ -89,7 +89,7 @@ Antigravity is the default runtime when `INTERCOM_RUNTIME` is absent. Its state 
 | `INTERCOM_LOG_BACKUPS` | Rotated log files retained | 2 |
 | `INTERCOM_DISABLE_LISTENER` | Set to `1` for tests or manual listener control | Off |
 | `INTERCOM_WIRE_V2` | Set to `1` only when both peers support topic-authenticated v2 | Off |
-| `INTERCOM_ALLOW_LEGACY_PLAINTEXT` | Unsafe Antigravity-only migration mode; never honored by Codex | Off |
+| `INTERCOM_ALLOW_LEGACY_PLAINTEXT` | Unsafe Antigravity-only migration mode; never honored by standard runtimes | Off |
 
 Custom relay and Blossom allowlists replace the built-in host list. Only WSS/HTTPS port 443 is accepted. Do not allow loopback, private, or link-local endpoints.
 

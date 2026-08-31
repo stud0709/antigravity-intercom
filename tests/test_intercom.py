@@ -1018,6 +1018,22 @@ class IdentityValidationTests(IsolatedStateTestCase):
             token = server.intercom_generate_pairing_token(sender_conversation_id=valid_id)
             self.assertIn("AGYPAIR-", token)
 
+    def test_generic_other_runtime_supports_inbox_and_identity(self):
+        with mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "cursor"}):
+            self.assertFalse(runtime_adapter.is_antigravity_runtime())
+            self.assertEqual(runtime_adapter.get_runtime(), "cursor")
+            
+            valid_id = runtime_adapter.get_or_create_local_identity()["identity"]
+            self.assertTrue(valid_id.startswith("cursor_"))
+            
+            token = server.intercom_generate_pairing_token(sender_conversation_id=valid_id)
+            self.assertIn("AGYPAIR-", token)
+            
+            # Inbox methods work for any generic runtime
+            inbox = json.loads(server.intercom_receive_messages())
+            self.assertEqual(inbox["runtime"], "cursor")
+            self.assertEqual(inbox["recipient_conversation_id"], valid_id)
+
 
 if __name__ == "__main__":
     unittest.main()

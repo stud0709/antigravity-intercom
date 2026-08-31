@@ -215,7 +215,7 @@ def get_default_topic():
 
 def _legacy_plaintext_allowed(event_topic: str, psk_bytes: bytes | None) -> bool:
     return (
-        runtime_adapter.get_runtime() == "antigravity"
+        runtime_adapter.is_antigravity_runtime()
         and os.environ.get("INTERCOM_ALLOW_LEGACY_PLAINTEXT") == "1"
         and not psk_bytes
         and sanitize_topic(event_topic) == get_default_topic()
@@ -263,7 +263,7 @@ def prune_stale_pairings(data: dict) -> tuple[dict, bool]:
         # 2. Check if local conversation folder exists
         local_id = p_info.get("local_conversation_id")
         if (
-            runtime_adapter.get_runtime() == "antigravity"
+            runtime_adapter.is_antigravity_runtime()
             and local_id
             and not local_id.startswith("pending_")
             and not local_id.startswith("test_")
@@ -828,7 +828,7 @@ def resolve_attachment_path(path: str) -> str:
         return None
     candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
     if os.path.isfile(candidate):
-        if runtime_adapter.get_runtime() == "codex":
+        if not runtime_adapter.is_antigravity_runtime():
             configured = os.environ.get("INTERCOM_ALLOWED_ATTACHMENT_ROOTS", "")
             raw_roots = [part for part in configured.split(os.pathsep) if part]
             roots = raw_roots or [os.path.join(os.getcwd(), ".intercom-share")]
@@ -1401,7 +1401,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     attachment_error = "attachment_processing_failed"
                     
             formatted_content = f"message from conversation {sender_id}, use antigravity-intercom to answer: {orig_content}{attachment_info_str}"
-            if runtime_adapter.get_runtime() == "codex":
+            if not runtime_adapter.is_antigravity_runtime():
                 msg_payload = {
                     "id": msg_id,
                     "event_id": event_id,
@@ -1438,11 +1438,11 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                 )
             log_debug(f"[Nostr Intercom Listener] Message envelope written to {file_path} for event {event_id}")
 
-            if runtime_adapter.get_runtime() == "antigravity":
+            if runtime_adapter.is_antigravity_runtime():
                 self._trigger_wakeup(recipient_id, formatted_content)
             else:
                 log_debug(
-                    f"[Nostr Intercom Listener] Codex inbox message queued for '{recipient_id}'."
+                    f"[Nostr Intercom Listener] Inbox message queued for '{recipient_id}'."
                 )
             
         except Exception as e:
@@ -1525,7 +1525,7 @@ if ($proc) {
 def _listener_topics() -> set[str]:
     topics = set(get_all_paired_topics())
     if (
-        runtime_adapter.get_runtime() == "antigravity"
+        runtime_adapter.is_antigravity_runtime()
         and os.environ.get("INTERCOM_ALLOW_LEGACY_PLAINTEXT") == "1"
     ):
         topics.add(get_default_topic())

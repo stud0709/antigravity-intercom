@@ -42,8 +42,7 @@ _start_background_listener()
 def _require_conversation_identity(value: str, param_name: str = "sender_conversation_id") -> str:
     val = (value or "").strip()
     if not val:
-        runtime = runtime_adapter.get_runtime()
-        if runtime == "antigravity":
+        if runtime_adapter.is_antigravity_runtime():
             raise ValueError(
                 f"'{param_name}' is required in Antigravity runtime. "
                 "Please specify your active conversation ID (e.g. from your current session) "
@@ -54,11 +53,11 @@ def _require_conversation_identity(value: str, param_name: str = "sender_convers
                 f"'{param_name}' is required. "
                 "Please provide your local endpoint identity (retrieve it via 'intercom_get_local_identity')."
             )
-    if runtime_adapter.get_runtime() == "codex":
+    if not runtime_adapter.is_antigravity_runtime():
         local_identity = runtime_adapter.get_or_create_local_identity()["identity"]
         if runtime_adapter.validate_identity(val) != local_identity:
             raise ValueError(
-                "Codex conversation ID must match intercom_get_local_identity()."
+                f"Conversation ID must match local endpoint identity '{local_identity}' (from intercom_get_local_identity)."
             )
         return local_identity
     return runtime_adapter.validate_identity(val, param_name)
@@ -126,10 +125,10 @@ def intercom_nostr_send_message(sender_conversation_id: str, recipient_conversat
 def intercom_list_pairings(local_conversation_id: str = "") -> str:
     """Lists active pairing metadata for this conversation without returning encryption keys."""
     runtime = runtime_adapter.get_runtime()
-    if runtime == "codex":
+    if not runtime_adapter.is_antigravity_runtime():
         effective_local_id = runtime_adapter.get_or_create_local_identity()["identity"]
         if local_conversation_id and runtime_adapter.validate_identity(local_conversation_id) != effective_local_id:
-            raise ValueError("Codex conversation ID must match intercom_get_local_identity().")
+            raise ValueError(f"Conversation ID must match local endpoint identity '{effective_local_id}'.")
     else:
         effective_local_id = runtime_adapter.validate_identity(local_conversation_id) if local_conversation_id else ""
 
@@ -168,7 +167,7 @@ def intercom_unpair(
 ) -> str:
     """Revokes and removes the local pairing for one remote endpoint."""
     runtime = runtime_adapter.get_runtime()
-    if runtime == "codex":
+    if not runtime_adapter.is_antigravity_runtime():
         effective_local_id = runtime_adapter.get_or_create_local_identity()["identity"]
     else:
         effective_local_id = runtime_adapter.validate_identity(local_conversation_id) if local_conversation_id else ""
@@ -192,13 +191,13 @@ def intercom_receive_messages(
     include_read: bool = False,
     wait_seconds: float = 0.0,
 ) -> str:
-    """Lists Codex inbox metadata without exposing message bodies.
+    """Lists inbox metadata without exposing message bodies.
 
     Select one returned ID with ``intercom_read_message``. ``wait_seconds`` may
     be between 0 and 20 seconds.
     """
-    if runtime_adapter.get_runtime() != "codex":
-        raise RuntimeError("This inbox tool is available only with INTERCOM_RUNTIME=codex.")
+    if runtime_adapter.is_antigravity_runtime():
+        raise RuntimeError("This inbox tool is available only for standard/inbox MCP runtimes (non-Antigravity).")
     if not recipient_conversation_id:
         recipient_conversation_id = runtime_adapter.get_or_create_local_identity()["identity"]
     else:
@@ -221,7 +220,7 @@ def intercom_receive_messages(
 
     return json.dumps(
         {
-            "runtime": "codex",
+            "runtime": runtime_adapter.get_runtime(),
             "recipient_conversation_id": recipient_conversation_id,
             "messages": messages,
         },
@@ -235,9 +234,9 @@ def intercom_read_message(
     recipient_conversation_id: str = "",
     mark_read: bool = True,
 ) -> str:
-    """Reads one explicitly selected untrusted Codex inbox message by ID."""
-    if runtime_adapter.get_runtime() != "codex":
-        raise RuntimeError("This inbox tool is available only with INTERCOM_RUNTIME=codex.")
+    """Reads one explicitly selected untrusted inbox message by ID."""
+    if runtime_adapter.is_antigravity_runtime():
+        raise RuntimeError("This inbox tool is available only for standard/inbox MCP runtimes (non-Antigravity).")
     if not recipient_conversation_id:
         recipient_conversation_id = runtime_adapter.get_or_create_local_identity()["identity"]
     else:
@@ -255,10 +254,10 @@ def intercom_delete_message(
     message_id: str,
     recipient_conversation_id: str = "",
 ) -> str:
-    """Deletes one selected Codex inbox message and its local attachment."""
+    """Deletes one selected inbox message and its local attachment."""
 
-    if runtime_adapter.get_runtime() != "codex":
-        raise RuntimeError("This inbox tool is available only with INTERCOM_RUNTIME=codex.")
+    if runtime_adapter.is_antigravity_runtime():
+        raise RuntimeError("This inbox tool is available only for standard/inbox MCP runtimes (non-Antigravity).")
     if not recipient_conversation_id:
         recipient_conversation_id = runtime_adapter.get_or_create_local_identity()["identity"]
     else:

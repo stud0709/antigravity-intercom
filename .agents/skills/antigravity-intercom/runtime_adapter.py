@@ -20,25 +20,23 @@ from pathlib import Path
 from typing import Any
 
 
-SUPPORTED_RUNTIMES = {"antigravity", "codex"}
+SUPPORTED_RUNTIMES = {"antigravity", "codex", "standard", "generic", "mcp"}
 IDENTITY_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,200}$")
 
 
 def get_runtime() -> str:
     """Return the selected host runtime.
 
-    Antigravity remains the compatibility default.  Codex configuration sets
-    ``INTERCOM_RUNTIME=codex`` explicitly, so merely having a .codex directory
-    never changes existing Antigravity installations.
+    Antigravity remains the compatibility default. Any non-antigravity runtime
+    ('codex', 'standard', 'generic', 'cursor', 'claude', etc.) operates under the
+    universal standard MCP inbox model.
     """
+    return os.environ.get("INTERCOM_RUNTIME", "antigravity").strip().lower() or "antigravity"
 
-    runtime = os.environ.get("INTERCOM_RUNTIME", "antigravity").strip().lower()
-    if runtime not in SUPPORTED_RUNTIMES:
-        raise ValueError(
-            f"Unsupported INTERCOM_RUNTIME '{runtime}'. "
-            f"Expected one of: {', '.join(sorted(SUPPORTED_RUNTIMES))}."
-        )
-    return runtime
+
+def is_antigravity_runtime() -> bool:
+    """True if running in Antigravity proprietary push runtime; False for universal MCP runtimes."""
+    return get_runtime() == "antigravity"
 
 
 def _ensure_private_directory(path: Path) -> Path:
@@ -56,8 +54,12 @@ def get_state_dir() -> Path:
     if explicit:
         return _ensure_private_directory(Path(explicit).expanduser().resolve())
 
-    if get_runtime() == "codex":
-        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    if not is_antigravity_runtime():
+        runtime = get_runtime()
+        if runtime == "codex":
+            home_base = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        else:
+            home_base = Path(os.environ.get("INTERCOM_HOME", Path.home() / ".intercom"))
         workspace_root = Path(
             os.environ.get("INTERCOM_WORKSPACE_ROOT", os.getcwd())
         ).expanduser().resolve()
@@ -66,7 +68,7 @@ def get_state_dir() -> Path:
             workspace_key.encode("utf-8")
         ).hexdigest()[:16]
         return _ensure_private_directory(
-            codex_home.expanduser() / "intercom" / "workspaces" / workspace_digest
+            home_base.expanduser() / "intercom" / "workspaces" / workspace_digest
         )
 
     return _ensure_private_directory(Path.home() / ".gemini" / "antigravity" / "brain")
@@ -317,7 +319,7 @@ def get_or_create_local_identity(alias: str = "") -> dict[str, str]:
                 current_alias = requested_alias
             return {"identity": identity, "alias": current_alias}
 
-        prefix = "codex" if get_runtime() == "codex" else "antigravity"
+        prefix = "antigravity" if is_antigravity_runtime() else get_runtime()
         payload = {
             "identity": f"{prefix}_{uuid.uuid4().hex}",
             "alias": (alias or "").strip()[:200],
@@ -336,14 +338,14 @@ def _identity_directory_name(identity: str) -> str:
 
 def conversation_exists(recipient_id: str) -> bool:
     recipient_id = validate_identity(recipient_id, "recipient_conversation_id")
-    if get_runtime() == "codex":
+    if not is_antigravity_runtime():
         return recipient_id == get_or_create_local_identity()["identity"]
     return (get_state_dir() / recipient_id).is_dir()
 
 
 def _endpoint_paths(recipient_id: str) -> tuple[Path, Path]:
     recipient_id = validate_identity(recipient_id, "recipient_conversation_id")
-    if get_runtime() == "codex":
+    if not is_antigravity_runtime():
         endpoint = get_state_dir() / "inbox" / _identity_directory_name(recipient_id)
         return endpoint / "messages", endpoint / "attachments"
     endpoint = get_state_dir() / recipient_id
@@ -763,8 +765,8 @@ def list_inbox_messages(
 ) -> list[dict[str, Any]]:
     """List metadata only; message bodies require an explicit read by ID."""
 
-    if get_runtime() != "codex":
-        raise RuntimeError("intercom_receive_messages is available only in Codex runtime.")
+    if is_antigravity_runtime():
+        raise RuntimeError("intercom_receive_messages is available only in generic/inbox MCP runtimes (non-Antigravity).")
     if not 1 <= int(limit) <= 100:
         raise ValueError("limit must be between 1 and 100.")
 
@@ -807,10 +809,10 @@ def read_inbox_message(
     message_id: str,
     mark_read: bool = True,
 ) -> dict[str, Any]:
-    """Read one explicitly selected Codex message from the local inbox."""
+    """Read one explicitly selected message from the local inbox."""
 
-    if get_runtime() != "codex":
-        raise RuntimeError("intercom_read_message is available only in Codex runtime.")
+    if is_antigravity_runtime():
+        raise RuntimeError("intercom_read_message is available only in generic/inbox MCP runtimes (non-Antigravity).")
     message_id = validate_identity(message_id, "message_id")
     path = get_messages_dir(recipient_id, create=True) / f"{message_id}.json"
     with registry_lock():
@@ -834,10 +836,10 @@ def read_inbox_message(
 
 
 def delete_inbox_message(recipient_id: str, message_id: str) -> bool:
-    """Delete one selected Codex envelope and its locally managed attachment."""
+    """Delete one selected envelope and its locally managed attachment."""
 
-    if get_runtime() != "codex":
-        raise RuntimeError("intercom_delete_message is available only in Codex runtime.")
+    if is_antigravity_runtime():
+        raise RuntimeError("intercom_delete_message is available only in generic/inbox MCP runtimes (non-Antigravity).")
     message_id = validate_identity(message_id, "message_id")
     messages_dir, attachments_dir = _endpoint_paths(recipient_id)
     path = messages_dir / f"{message_id}.json"
