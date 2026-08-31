@@ -989,5 +989,35 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(server["command"].endswith("python.exe"))
 
 
+class IdentityValidationTests(IsolatedStateTestCase):
+    def test_antigravity_identity_is_required(self):
+        with mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "antigravity"}):
+            with self.assertRaises(ValueError) as ctx:
+                server.intercom_generate_pairing_token(sender_conversation_id="")
+            self.assertIn("required in Antigravity runtime", str(ctx.exception))
+
+            with self.assertRaises(ValueError) as ctx:
+                server.intercom_pair(pairing_token="dummy", my_conversation_id="")
+            self.assertIn("required in Antigravity runtime", str(ctx.exception))
+
+            # Passing valid conversation ID succeeds
+            token = server.intercom_generate_pairing_token(sender_conversation_id="conv-123")
+            self.assertIn("AGYPAIR-", token)
+
+    def test_codex_identity_is_required_and_must_match(self):
+        with mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "codex"}):
+            with self.assertRaises(ValueError) as ctx:
+                server.intercom_generate_pairing_token(sender_conversation_id="")
+            self.assertIn("intercom_get_local_identity", str(ctx.exception))
+
+            with self.assertRaises(ValueError) as ctx:
+                server.intercom_generate_pairing_token(sender_conversation_id="wrong_id")
+            self.assertIn("must match", str(ctx.exception))
+
+            valid_id = runtime_adapter.get_or_create_local_identity()["identity"]
+            token = server.intercom_generate_pairing_token(sender_conversation_id=valid_id)
+            self.assertIn("AGYPAIR-", token)
+
+
 if __name__ == "__main__":
     unittest.main()

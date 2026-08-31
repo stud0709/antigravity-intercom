@@ -39,17 +39,29 @@ def _start_background_listener() -> None:
 _start_background_listener()
 
 
-def _local_identity_or(value: str) -> str:
+def _require_conversation_identity(value: str, param_name: str = "sender_conversation_id") -> str:
+    val = (value or "").strip()
+    if not val:
+        runtime = runtime_adapter.get_runtime()
+        if runtime == "antigravity":
+            raise ValueError(
+                f"'{param_name}' is required in Antigravity runtime. "
+                "Please specify your active conversation ID (e.g. from your current session) "
+                "so that incoming messages and wakeups can be delivered directly to this conversation thread."
+            )
+        else:
+            raise ValueError(
+                f"'{param_name}' is required. "
+                "Please provide your local endpoint identity (retrieve it via 'intercom_get_local_identity')."
+            )
     if runtime_adapter.get_runtime() == "codex":
         local_identity = runtime_adapter.get_or_create_local_identity()["identity"]
-        if value and runtime_adapter.validate_identity(value) != local_identity:
+        if runtime_adapter.validate_identity(val) != local_identity:
             raise ValueError(
                 "Codex conversation ID must match intercom_get_local_identity()."
             )
         return local_identity
-    if value:
-        return runtime_adapter.validate_identity(value)
-    return runtime_adapter.get_or_create_local_identity()["identity"]
+    return runtime_adapter.validate_identity(val, param_name)
 
 
 @mcp.tool()
@@ -58,13 +70,13 @@ def intercom_get_local_identity(alias: str = "") -> str:
     return json.dumps(runtime_adapter.get_or_create_local_identity(alias), indent=2)
 
 @mcp.tool()
-def intercom_generate_pairing_token(sender_conversation_id: str = "", recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
+def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
     """
     Generates a secure, self-contained pairing token (Topic UUID + AES-256-GCM Key).
     Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours. Use 0 for permanent / no expiration).
     Give this token to another agent/conversation to pair with them end-to-end encrypted.
     """
-    sender_conversation_id = _local_identity_or(sender_conversation_id)
+    sender_conversation_id = _require_conversation_identity(sender_conversation_id, "sender_conversation_id")
     token = nostr_relay.generate_pairing_token(
         local_conversation_id=sender_conversation_id,
         recipient_hint=recipient_hint,
@@ -79,14 +91,14 @@ def intercom_generate_pairing_token(sender_conversation_id: str = "", recipient_
 @mcp.tool()
 def intercom_pair(
     pairing_token: str,
-    my_conversation_id: str = "",
+    my_conversation_id: str,
     allow_permanent: bool = False,
 ) -> str:
     """
     Consumes a pairing token from another agent to establish a secure, End-to-End Encrypted (E2EE) connection.
     Automatically starts listening on the paired channel and transmits an encrypted acknowledgment.
     """
-    my_conversation_id = _local_identity_or(my_conversation_id)
+    my_conversation_id = _require_conversation_identity(my_conversation_id, "my_conversation_id")
     result = nostr_relay.consume_pairing_token(
         token_str=pairing_token,
         my_conversation_id=my_conversation_id,
@@ -101,7 +113,7 @@ def intercom_nostr_send_message(sender_conversation_id: str, recipient_conversat
     Automatically uses the pre-shared key and topic from the pairing registry.
     The recipient machine's background listener will catch the event, decrypt the payload, save attachments, and trigger an agent wakeup.
     """
-    sender_conversation_id = _local_identity_or(sender_conversation_id)
+    sender_conversation_id = _require_conversation_identity(sender_conversation_id, "sender_conversation_id")
     return nostr_relay.publish_nostr_intercom_message(
         sender_conversation_id=sender_conversation_id,
         recipient_conversation_id=recipient_conversation_id,
@@ -113,11 +125,18 @@ def intercom_nostr_send_message(sender_conversation_id: str, recipient_conversat
 @mcp.tool()
 def intercom_list_pairings(local_conversation_id: str = "") -> str:
     """Lists active pairing metadata for this conversation without returning encryption keys."""
-    effective_local_id = _local_identity_or(local_conversation_id)
+    runtime = runtime_adapter.get_runtime()
+    if runtime == "codex":
+        effective_local_id = runtime_adapter.get_or_create_local_identity()["identity"]
+        if local_conversation_id and runtime_adapter.validate_identity(local_conversation_id) != effective_local_id:
+            raise ValueError("Codex conversation ID must match intercom_get_local_identity().")
+    else:
+        effective_local_id = runtime_adapter.validate_identity(local_conversation_id) if local_conversation_id else ""
+
     data = nostr_relay.load_pairings()
     pairings = []
     for pairing in data.get("pairings", {}).values():
-        if pairing.get("local_conversation_id") != effective_local_id:
+        if effective_local_id and pairing.get("local_conversation_id") != effective_local_id:
             continue
         pairings.append(
             {
@@ -135,7 +154,7 @@ def intercom_list_pairings(local_conversation_id: str = "") -> str:
         )
     return json.dumps(
         {
-            "runtime": runtime_adapter.get_runtime(),
+            "runtime": runtime,
             "local_conversation_id": effective_local_id,
             "pairings": pairings,
         },
@@ -148,7 +167,11 @@ def intercom_unpair(
     recipient_conversation_id: str, local_conversation_id: str = ""
 ) -> str:
     """Revokes and removes the local pairing for one remote endpoint."""
-    effective_local_id = _local_identity_or(local_conversation_id)
+    runtime = runtime_adapter.get_runtime()
+    if runtime == "codex":
+        effective_local_id = runtime_adapter.get_or_create_local_identity()["identity"]
+    else:
+        effective_local_id = runtime_adapter.validate_identity(local_conversation_id) if local_conversation_id else ""
     removed = nostr_relay.delete_pairing(
         recipient_conversation_id, local_conversation_id=effective_local_id
     )
@@ -176,7 +199,10 @@ def intercom_receive_messages(
     """
     if runtime_adapter.get_runtime() != "codex":
         raise RuntimeError("This inbox tool is available only with INTERCOM_RUNTIME=codex.")
-    recipient_conversation_id = _local_identity_or(recipient_conversation_id)
+    if not recipient_conversation_id:
+        recipient_conversation_id = runtime_adapter.get_or_create_local_identity()["identity"]
+    else:
+        recipient_conversation_id = runtime_adapter.validate_identity(recipient_conversation_id)
     wait_seconds = float(wait_seconds)
     if wait_seconds < 0 or wait_seconds > 20:
         raise ValueError("wait_seconds must be between 0 and 20.")
@@ -212,7 +238,10 @@ def intercom_read_message(
     """Reads one explicitly selected untrusted Codex inbox message by ID."""
     if runtime_adapter.get_runtime() != "codex":
         raise RuntimeError("This inbox tool is available only with INTERCOM_RUNTIME=codex.")
-    recipient_conversation_id = _local_identity_or(recipient_conversation_id)
+    if not recipient_conversation_id:
+        recipient_conversation_id = runtime_adapter.get_or_create_local_identity()["identity"]
+    else:
+        recipient_conversation_id = runtime_adapter.validate_identity(recipient_conversation_id)
     payload = runtime_adapter.read_inbox_message(
         recipient_conversation_id,
         message_id,
@@ -230,7 +259,10 @@ def intercom_delete_message(
 
     if runtime_adapter.get_runtime() != "codex":
         raise RuntimeError("This inbox tool is available only with INTERCOM_RUNTIME=codex.")
-    recipient_conversation_id = _local_identity_or(recipient_conversation_id)
+    if not recipient_conversation_id:
+        recipient_conversation_id = runtime_adapter.get_or_create_local_identity()["identity"]
+    else:
+        recipient_conversation_id = runtime_adapter.validate_identity(recipient_conversation_id)
     removed = runtime_adapter.delete_inbox_message(
         recipient_conversation_id, message_id
     )
