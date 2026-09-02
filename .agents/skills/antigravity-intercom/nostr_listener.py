@@ -43,17 +43,15 @@ def ensure_single_instance() -> bool:
                     content = handle.read().strip()
                 old_pid = int(content) if content.isdigit() else 0
                 if _process_exists(old_pid) and old_pid != current_pid:
-                    try:
-                        if sys.platform == "win32":
-                            import subprocess
-                            no_win = subprocess.CREATE_NO_WINDOW
-                            subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], capture_output=True, creationflags=no_win)
-                        else:
-                            os.kill(old_pid, 9)
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                os.unlink(pid_file)
+                    nostr_relay.log_debug(
+                        f"[SingleInstance] Active listener PID {old_pid} is already running. Exiting redundant process {current_pid}."
+                    )
+                    return False
+                # Stale PID file from a dead process
+                try:
+                    os.unlink(pid_file)
+                except OSError:
+                    pass
                 continue
             except OSError as exc:
                 nostr_relay.log_debug(f"[SingleInstance] Cannot inspect PID file: {exc}")

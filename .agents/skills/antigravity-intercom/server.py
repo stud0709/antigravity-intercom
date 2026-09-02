@@ -14,8 +14,39 @@ import runtime_adapter
 
 mcp = FastMCP("AntigravityIntercom")
 
+def _is_listener_running() -> bool:
+    pid_file = runtime_adapter.get_pid_file_path()
+    if not os.path.isfile(pid_file):
+        return False
+    try:
+        with open(pid_file, "r", encoding="utf-8") as handle:
+            content = handle.read().strip()
+        pid = int(content) if content.isdigit() else 0
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+            process_query_limited_information = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                process_query_limited_information, False, pid
+            )
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    except OSError:
+        return False
+
+
 def _start_background_listener() -> None:
     if os.environ.get("INTERCOM_DISABLE_LISTENER") == "1":
+        return
+    if _is_listener_running():
         return
     try:
         listener_script = os.path.join(script_dir, "nostr_listener.py")
