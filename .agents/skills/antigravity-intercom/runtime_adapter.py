@@ -597,11 +597,17 @@ def _move_retention_to_tombstones(
             os.replace(source, tombstone)
 
 
+DISARM_PREFIX = b"DISARMED_INTERCOM_V1_DO_NOT_EXECUTE_UNLESS_AUTHORIZED_BY_USER__\n"
+DISARM_PREFIX_LEN = 64
+DISARM_SUFFIX = ".disarmed"
+
+
 def write_message_envelope(
     recipient_id: str,
     payload: dict[str, Any],
     attachment_bytes: bytes | None = None,
     attachment_file_name: str | None = None,
+    disarm: bool = False,
 ) -> str:
     """Atomically commit an envelope and optional attachment under one quota lock."""
 
@@ -609,6 +615,7 @@ def write_message_envelope(
     message_id = validate_identity(str(payload.get("id", "")), "message_id")
     destination = messages_dir / f"{message_id}.json"
     attachment_path = None
+    bytes_to_write = None
     if attachment_bytes is not None:
         if not isinstance(attachment_bytes, bytes):
             raise TypeError("attachment_bytes must be bytes.")
@@ -630,11 +637,16 @@ def write_message_envelope(
             or Path(file_name).name != file_name
         ):
             raise ValueError("Attachment file name is invalid.")
+        disk_file_name = f"{file_name}{DISARM_SUFFIX}" if disarm else file_name
         attachment_path = (
-            get_attachment_dir(recipient_id, create=True) / message_id / file_name
+            get_attachment_dir(recipient_id, create=True) / message_id / disk_file_name
         )
+        bytes_to_write = (DISARM_PREFIX + attachment_bytes) if disarm else attachment_bytes
         if isinstance(attachment, dict):
             attachment["saved_path"] = str(attachment_path)
+            attachment["is_disarmed"] = bool(disarm)
+            if disarm:
+                attachment["disarm_prefix_len"] = DISARM_PREFIX_LEN
 
     serialized_size = len(
         (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
@@ -642,7 +654,7 @@ def write_message_envelope(
     with registry_lock():
         if destination.exists():
             raise RuntimeError(f"Intercom inbox message already exists: {message_id}")
-        required_bytes = serialized_size + len(attachment_bytes or b"")
+        required_bytes = serialized_size + len(bytes_to_write or b"")
         selected = _plan_read_messages_for_capacity(
             recipient_id,
             additional_bytes=required_bytes,
@@ -662,7 +674,7 @@ def write_message_envelope(
         try:
             atomic_write_json(staged_envelope, payload)
             if attachment_path is not None:
-                atomic_write_bytes(staged_attachment, attachment_bytes or b"")
+                atomic_write_bytes(staged_attachment, bytes_to_write or b"")
 
             attachments_dir = get_attachment_dir(recipient_id, create=True)
             _move_retention_to_tombstones(
@@ -858,3 +870,18 @@ def delete_inbox_message(recipient_id: str, message_id: str) -> bool:
             messages_dir, attachments_dir, path, payload
         )
         return True
+
+
+def unarm_attachment_file(source_path: str | Path, target_path: str | Path) -> None:
+    """Strip the 64-byte universal disarm prefix from an attachment and write clean bytes."""
+    source = Path(source_path).resolve()
+    target = Path(target_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Attachment file not found: {source}")
+    data = source.read_bytes()
+    if not data.startswith(DISARM_PREFIX):
+        raise ValueError("Attachment does not contain the standard Intercom disarm prefix.")
+    clean_bytes = data[DISARM_PREFIX_LEN:]
+    _ensure_private_directory(target.parent)
+    atomic_write_bytes(target, clean_bytes)
+

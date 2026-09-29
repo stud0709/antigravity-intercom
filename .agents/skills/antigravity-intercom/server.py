@@ -3,6 +3,7 @@ import sys
 import json
 import subprocess
 import time
+from pathlib import Path
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
@@ -100,22 +101,49 @@ def intercom_get_local_identity(alias: str = "") -> str:
     return json.dumps(runtime_adapter.get_or_create_local_identity(alias), indent=2)
 
 @mcp.tool()
-def intercom_generate_pairing_token(sender_conversation_id: str, recipient_hint: str = "", ttl_hours: float = 24.0) -> str:
+def intercom_generate_pairing_token(
+    sender_conversation_id: str,
+    recipient_hint: str = "",
+    ttl_hours: float = 24.0,
+    policy_preset: str = "support_hotline",
+    wakeup: str = "",
+    reply_mode: str = "",
+    local_ops: str = "",
+    external_access: str = "",
+    accept_attachments: str = "",
+) -> str:
     """
-    Generates a secure, self-contained pairing token (Topic UUID + AES-256-GCM Key).
-    Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours. Use 0 for permanent / no expiration).
-    Give this token to another agent/conversation to pair with them end-to-end encrypted.
+    Generates a secure, self-contained pairing token (Topic UUID + AES-256-GCM Key + Policy v2).
+    Supports optional TTL (Time-To-Live in hours, defaults to 24.0 hours. Use 0 for permanent).
+    Supports policy presets ('support_hotline', 'code_audit', 'trusted_peer', 'inbox_only')
+    and granular overrides for wakeup ('on'/'off'), reply_mode ('report_to_user'/'direct'),
+    local_ops ('none'/'readonly'/'full'), external_access ('deny'/'allow'),
+    and accept_attachments ('allow'/'deny').
     """
     _start_background_listener()
     sender_conversation_id = _require_conversation_identity(sender_conversation_id, "sender_conversation_id")
+    overrides = {}
+    if wakeup:
+        overrides["wakeup"] = wakeup
+    if reply_mode:
+        overrides["reply_mode"] = reply_mode
+    if local_ops:
+        overrides["local_ops"] = local_ops
+    if external_access:
+        overrides["external_access"] = external_access
+    if accept_attachments:
+        overrides["accept_attachments"] = accept_attachments
+
     token = nostr_relay.generate_pairing_token(
         local_conversation_id=sender_conversation_id,
         recipient_hint=recipient_hint,
-        ttl_hours=ttl_hours
+        ttl_hours=ttl_hours,
+        policy=policy_preset,
+        **overrides,
     )
     ttl_msg = f"valid for {ttl_hours} hours" if ttl_hours and ttl_hours > 0 else "permanent (no expiration)"
     return (
-        f"Pairing token generated ({ttl_msg}). SECRET: it contains the channel key "
+        f"Pairing token generated ({ttl_msg}, policy: {policy_preset}). SECRET: it contains the channel key "
         f"and is shown once. Transfer it only through a trusted channel:\n{token}"
     )
 
@@ -181,6 +209,7 @@ def intercom_list_pairings(local_conversation_id: str = "") -> str:
                     "created_at",
                     "expires_at",
                     "alias",
+                    "policy",
                 )
                 if pairing.get(key) is not None
             }
@@ -308,5 +337,89 @@ def intercom_delete_message(
         indent=2,
     )
 
+
+@mcp.tool()
+def intercom_unarm_attachment(
+    message_id: str,
+    target_file_name: str = "",
+    recipient_conversation_id: str = "",
+) -> str:
+    """
+    Safely unarms a quarantined attachment by stripping the 64-byte disarm prefix.
+    Only call this tool when the user has EXPLICITLY requested extracting or unarming the attachment.
+    Writes the clean file into .intercom-share directory (e.g. .intercom-share/<file_name>).
+    """
+    message_id = runtime_adapter.validate_identity(message_id, "message_id")
+    if runtime_adapter.is_antigravity_runtime():
+        recipient_id = (
+            runtime_adapter.validate_identity(recipient_conversation_id, "recipient_conversation_id")
+            if recipient_conversation_id
+            else ""
+        )
+        if not recipient_id:
+            # Look up which conversation folder owns this message_id in brain
+            state_dir = runtime_adapter.get_state_dir()
+            for conv_dir in state_dir.iterdir():
+                if conv_dir.is_dir() and (conv_dir / ".system_generated" / "messages" / f"{message_id}.json").is_file():
+                    recipient_id = conv_dir.name
+                    break
+        if not recipient_id:
+            raise FileNotFoundError(f"Intercom message '{message_id}' not found in any local conversation.")
+    else:
+        if recipient_conversation_id:
+            recipient_id = runtime_adapter.validate_identity(recipient_conversation_id)
+        else:
+            recipient_id = runtime_adapter.get_or_create_local_identity()["identity"]
+
+    messages_dir = runtime_adapter.get_messages_dir(recipient_id, create=False)
+    envelope_file = messages_dir / f"{message_id}.json"
+    if not envelope_file.is_file():
+        raise FileNotFoundError(f"Intercom envelope '{message_id}' not found.")
+    
+    try:
+        payload = json.loads(envelope_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read envelope '{message_id}': {exc}")
+
+    attachment = payload.get("attachment")
+    if not attachment or not isinstance(attachment, dict):
+        raise ValueError(f"Message '{message_id}' does not contain an attachment.")
+
+    saved_path_str = attachment.get("saved_path")
+    if not saved_path_str:
+        raise FileNotFoundError(f"Attachment file path missing from envelope '{message_id}'.")
+    
+    saved_path = Path(saved_path_str).resolve()
+    if not saved_path.is_file():
+        raise FileNotFoundError(f"Attachment file '{saved_path}' does not exist on disk.")
+
+    original_file_name = attachment.get("file_name", "attachment.bin")
+    
+    # Restrict target path strictly to .intercom-share
+    workspace_root = Path(os.environ.get("INTERCOM_WORKSPACE_ROOT", os.getcwd())).resolve()
+    share_root = (workspace_root / ".intercom-share").resolve()
+    share_root.mkdir(parents=True, exist_ok=True)
+
+    dest_name = target_file_name.strip() if target_file_name else original_file_name
+    dest_name = Path(dest_name).name  # sanitize: prevent directory traversal
+    if not dest_name:
+        dest_name = original_file_name
+
+    target_path = (share_root / dest_name).resolve()
+    if os.path.commonpath([str(share_root), str(target_path)]) != str(share_root):
+        raise ValueError("Target path must remain inside .intercom-share directory.")
+
+    runtime_adapter.unarm_attachment_file(saved_path, target_path)
+
+    return json.dumps({
+        "status": "unarmed",
+        "message_id": message_id,
+        "original_file_name": original_file_name,
+        "unarmed_path": str(target_path).replace("\\", "/"),
+        "message": f"Successfully stripped 64-byte disarm prefix and extracted clean attachment to '{target_path.name}' in .intercom-share."
+    }, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()
+

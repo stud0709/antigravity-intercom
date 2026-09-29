@@ -63,6 +63,7 @@ class McpStdioTests(unittest.IsolatedAsyncioTestCase):
                             "intercom_pair",
                             "intercom_read_message",
                             "intercom_receive_messages",
+                            "intercom_unarm_attachment",
                             "intercom_unpair",
                         },
                     )
