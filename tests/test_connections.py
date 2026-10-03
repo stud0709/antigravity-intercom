@@ -18,11 +18,16 @@ from test_intercom import IsolatedStateTestCase, nostr_relay as relay, runtime_a
 import connections as c
 import connection_tools as tools
 import codex_router
+import relay_health
+import coordination
 
 
 class PrivateConnectionTests(IsolatedStateTestCase):
     def setUp(self):
         super().setUp()
+        discovery = mock.patch.object(relay_health, "fetch_information", return_value={})
+        discovery.start()
+        self.addCleanup(discovery.stop)
         self.root = Path(self.temporary_directory.name)
         self.service_state = self.root / "service-state"
         self.client_state = self.root / "client-state"
@@ -97,6 +102,272 @@ class PrivateConnectionTests(IsolatedStateTestCase):
         event.content.return_value = packet[1]
         with self.at(state):
             asyncio.run(relay.IntercomNotificationHandler().handle("wss://test", "subscription", event))
+
+    def store_message(self, state, topic, read=False):
+        with self.at(state), c.registry() as data:
+            entry = data["topics"][topic]
+            endpoint = entry["local_conversation_id"]
+            payload = {"id": str(uuid.uuid4()), "topic": topic,
+                       "connection_id": entry["connection_id"], "recipient": endpoint,
+                       "type": "message", "content": "stored message",
+                       "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                       "attachment": {"file_name": "sample.txt"}}
+            if read:
+                payload["read_at"] = payload["timestamp"]
+        with self.at(state):
+            path = c.commit_message(endpoint, payload, attachment_bytes=b"attachment", disarm=True)
+        return Path(path), Path(payload["attachment"]["saved_path"])
+
+    def configure_work(self, session, coalesce=False, peer_control=True):
+        with self.at(self.service_state):
+            c.configure_task(self.service["local_credential"], session["connection_id"], "work", "coordinator", "participant", coalesce=coalesce)
+        with self.at(self.client_state):
+            c.configure_task(self.client["local_credential"], session["connection_id"], "work", "participant", "coordinator",
+                             allow_peer_control=peer_control, coalesce=coalesce)
+
+    def task_metadata(self, kind="instruction", revision=1, generation=0, reply=None):
+        return {"version": 1, "task_id": "work", "kind": kind, "revision": revision,
+                "generation": generation, "in_reply_to": reply, "items": ["one"],
+                "baseline": [{"workspace_role": "primary", "commit": "a" * 40}]}
+
+    def send_task(self, state, owner, session, metadata, content="task body"):
+        with self.at(state):
+            result = asyncio.run(c.send(owner["local_credential"], session["connection_id"], content, task=metadata, details=True))
+        return result, self.outgoing.pop(0)
+
+    def test_task_delayed_revision_and_acknowledgment_cannot_advance_current_work(self):
+        session, _, _ = self.establish()
+        self.configure_work(session)
+        with self.at(self.client_state):
+            c.register_delivery(self.client["local_credential"], session["topic"])
+        first, older = self.send_task(self.service_state, self.service, session, self.task_metadata())
+        second, newer = self.send_task(self.service_state, self.service, session, self.task_metadata(revision=2))
+        self.runner.reset_mock()
+        self.deliver(self.client_state, newer)
+        self.deliver(self.client_state, older)
+        self.assertEqual(self.runner.call_count, 1)
+        with self.at(self.client_state):
+            messages = c.inbox(self.client["local_credential"])
+            old_id = next(value["id"] for value in messages if value["source_message_id"] == first["message_id"])
+            self.assertEqual(c.read(self.client["local_credential"], old_id, False)["task_applicability"], "obsolete")
+            status = c.task_status(self.client["local_credential"], session["connection_id"], "work")
+            self.assertEqual(status["revision"], 2)
+            self.assertEqual(status["accepted"], {})
+            self.assertEqual(status["semantic_acceptance_pending"], ["local", "peer"])
+            self.assertEqual({message["applicability"] for message in status["inbox_messages"]}, {"current", "obsolete"})
+            with self.assertRaises(ValueError):
+                c.accept_task(self.client["local_credential"], session["connection_id"], "work", first["message_id"], 1, 0)
+            accepted = c.accept_task(self.client["local_credential"], session["connection_id"], "work", second["message_id"], 2, 0)
+            self.assertFalse(accepted["sent_to_peer"])
+        acknowledgement, packet = self.send_task(self.client_state, self.client, session,
+            self.task_metadata("accepted", revision=2, reply=second["message_id"]))
+        self.deliver(self.service_state, packet)
+        with self.at(self.service_state):
+            status = c.task_status(self.service["local_credential"], session["connection_id"], "work")
+            self.assertEqual(status["accepted"]["peer"]["message_id"], acknowledgement["message_id"])
+        self.assertEqual(self.outgoing, [])
+
+    def test_task_local_pause_survives_restart_and_invalidates_queued_instruction(self):
+        session, _, _ = self.establish()
+        self.configure_work(session)
+        instruction, packet = self.send_task(self.service_state, self.service, session, self.task_metadata())
+        self.deliver(self.client_state, packet)
+        with self.at(self.client_state):
+            inbox_id = c.inbox(self.client["local_credential"])[0]["id"]
+            c.accept_task(self.client["local_credential"], session["connection_id"], "work", instruction["message_id"], 1, 0)
+            paused = c.task_control(self.client["local_credential"], session["connection_id"], "work", "pause")
+            self.assertEqual(paused["generation"], 1)
+            # Each call reloads the durable registry, as a new worker would.
+            self.assertTrue(c.task_status(self.client["local_credential"], session["connection_id"], "work")["paused"])
+            c.register_delivery(self.client["local_credential"], session["topic"])
+            self.runner.reset_mock()
+            self.assertFalse(c.wake(session["topic"], runtime.get_or_create_local_identity()["identity"], inbox_id))
+            read = c.read(self.client["local_credential"], inbox_id, False)
+            self.assertEqual(read["task_applicability"], "paused")
+            self.assertFalse(read["task_work_applicable"])
+            resumed = c.task_control(self.client["local_credential"], session["connection_id"], "work", "resume")
+            self.assertEqual(resumed["generation"], 2)
+            with self.assertRaises(ValueError):
+                c.accept_task(self.client["local_credential"], session["connection_id"], "work", instruction["message_id"], 1, 0)
+        self.runner.assert_not_called()
+
+    def test_task_report_policy_allows_local_acceptance_without_an_automatic_reply(self):
+        session, _, _ = self.establish()
+        self.configure_work(session)
+        instruction, packet = self.send_task(self.service_state, self.service, session, self.task_metadata())
+        self.deliver(self.client_state, packet)
+        with self.at(self.client_state):
+            with c.registry(write=True) as data:
+                data["topics"][session["topic"]]["policy"]["reply_mode"] = "report_to_user"
+            c.accept_task(self.client["local_credential"], session["connection_id"], "work", instruction["message_id"], 1, 0)
+            self.assertEqual(self.outgoing, [])
+            result = json.loads(asyncio.run(tools.intercom_send_task_message(self.client["local_credential"], session["connection_id"],
+                self.task_metadata("accepted", reply=instruction["message_id"]), "acknowledged")))
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(self.outgoing, [])
+
+    def test_paused_and_resumed_without_fresh_instruction_cannot_publish_task_work(self):
+        session, _, _ = self.establish()
+        self.configure_work(session)
+        instruction, packet = self.send_task(self.service_state, self.service, session, self.task_metadata())
+        self.deliver(self.client_state, packet)
+        with self.at(self.service_state):
+            c.task_control(self.service["local_credential"], session["connection_id"], "work", "pause")
+            with self.assertRaises(ValueError):
+                asyncio.run(c.send(self.service["local_credential"], session["connection_id"], "stale work",
+                                   task=self.task_metadata(revision=2, generation=1)))
+            self.assertEqual(self.outgoing, [])
+            c.task_control(self.service["local_credential"], session["connection_id"], "work", "resume")
+            with self.assertRaises(ValueError):
+                asyncio.run(c.send(self.service["local_credential"], session["connection_id"], "premature progress",
+                                   task=self.task_metadata("progress", generation=2, reply=instruction["message_id"])))
+            self.assertEqual(self.outgoing, [])
+
+    def test_antigravity_task_notifications_coalesce_and_revalidate_local_pause(self):
+        with mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "antigravity"}), self.at(self.service_state):
+            coordinator = c.register_agent("task-coordinator", self.service["workspace"])
+            participant = c.register_agent("task-participant", self.client["workspace"])
+            invitation = c.generate(coordinator["local_credential"], "trusted_peer", 1)
+            session = c.connect(participant["local_credential"], invitation["pairing_token"], "trusted_peer")
+            asyncio.run(c.pending_requests())
+            request = self.outgoing.pop(0)
+            asyncio.run(c.receive(request[0], request[1]))
+            acceptance = self.outgoing.pop(0)
+            asyncio.run(c.receive(acceptance[0], acceptance[1]))
+            c.configure_task(coordinator["local_credential"], session["connection_id"], "work", "coordinator", "participant", coalesce=True)
+            c.configure_task(participant["local_credential"], session["connection_id"], "work", "participant", "coordinator", coalesce=True)
+            instruction, packet = self.send_task(self.service_state, coordinator, session, self.task_metadata(), "PRIVATE INSTRUCTION")
+            with mock.patch.object(relay.IntercomNotificationHandler, "_trigger_wakeup", return_value=True) as host:
+                self.deliver(self.service_state, packet)
+                host.assert_called_once()
+                self.assertEqual(host.call_args.args[0], "task-participant")
+                self.assertNotIn("PRIVATE INSTRUCTION", host.call_args.args[1])
+                local_id = c.inbox(participant["local_credential"])[0]["id"]
+                c.accept_task(participant["local_credential"], session["connection_id"], "work", instruction["message_id"], 1, 0)
+                host.reset_mock()
+                for _ in range(2):
+                    _, packet = self.send_task(self.service_state, coordinator, session,
+                                              self.task_metadata("progress", reply=instruction["message_id"]))
+                    with mock.patch.object(coordination.time, "time", return_value=100):
+                        self.deliver(self.service_state, packet)
+                host.assert_not_called()
+                with mock.patch.object(coordination.time, "time", return_value=107):
+                    c.flush_notifications()
+                host.assert_called_once()
+                self.assertEqual(len(c.connection_health(participant["local_credential"], session["connection_id"])["wakeup"][-1]["message_ids"]), 2)
+                paused = c.task_control(participant["local_credential"], session["connection_id"], "work", "pause")
+                self.assertFalse(paused["host_execution_cancellation"])
+                self.assertEqual(c.read(participant["local_credential"], local_id, False)["task_applicability"], "paused")
+                host.reset_mock()
+                _, packet = self.send_task(self.service_state, coordinator, session,
+                                          self.task_metadata("progress", reply=instruction["message_id"]))
+                self.deliver(self.service_state, packet)
+                c.flush_notifications()
+                host.assert_not_called()
+                self.assertEqual(len(c.inbox(participant["local_credential"])), 4)
+
+    def test_task_coalescing_persists_ids_prioritizes_blocker_and_never_requeues_unknown_host_result(self):
+        session, _, _ = self.establish()
+        self.configure_work(session, coalesce=True)
+        instruction, packet = self.send_task(self.service_state, self.service, session, self.task_metadata())
+        self.deliver(self.client_state, packet)
+        with self.at(self.client_state):
+            c.register_delivery(self.client["local_credential"], session["topic"])
+        self.runner.reset_mock()
+        for _ in range(3):
+            _, packet = self.send_task(self.service_state, self.service, session,
+                                      self.task_metadata("progress", reply=instruction["message_id"]))
+            self.deliver(self.client_state, packet)
+        self.runner.assert_not_called()
+        _, blocker = self.send_task(self.service_state, self.service, session,
+                                    self.task_metadata("blocker", reply=instruction["message_id"]), "SECRET BLOCKER")
+        with mock.patch.object(codex_router, "_run", side_effect=RuntimeError("PRIVATE HOST ERROR")) as queue:
+            self.deliver(self.client_state, blocker)
+            queue.assert_called_once()
+            self.assertNotIn("SECRET BLOCKER", str(queue.call_args))
+            with self.at(self.client_state):
+                data = json.loads(Path(runtime.get_pairings_file_path()).read_text())
+                task_record = next(iter(data["tasks"].values()))
+                self.assertEqual(task_record["pending"], [])
+                c.flush_notifications()
+                queue.assert_called_once()
+                health = c.connection_health(self.client["local_credential"], session["connection_id"])
+                self.assertEqual(health["wakeup"][-1]["status"], "unknown")
+                self.assertEqual(len(health["wakeup"][-1]["message_ids"]), 4)
+                self.assertNotIn("SECRET", json.dumps(health))
+                self.assertEqual(len(c.inbox(self.client["local_credential"])), 5)
+
+    def test_task_debounce_is_flushed_after_restart_and_cleaned_on_revocation(self):
+        session, _, _ = self.establish()
+        self.configure_work(session, coalesce=True)
+        instruction, packet = self.send_task(self.service_state, self.service, session, self.task_metadata())
+        self.deliver(self.client_state, packet)
+        with self.at(self.client_state):
+            c.register_delivery(self.client["local_credential"], session["topic"])
+        _, packet = self.send_task(self.service_state, self.service, session,
+                                  self.task_metadata("progress", reply=instruction["message_id"]))
+        with mock.patch.object(coordination.time, "time", return_value=100):
+            self.deliver(self.client_state, packet)
+        self.runner.reset_mock()
+        with self.at(self.client_state), mock.patch.object(coordination.time, "time", return_value=107):
+            c.flush_notifications()
+            self.runner.assert_called_once()
+            c.flush_notifications()
+            self.runner.assert_called_once()
+            c.revoke(self.client["local_credential"], session["topic"])
+            with c.registry() as data:
+                self.assertEqual(data["tasks"], {})
+
+    def test_task_unregistered_and_malformed_envelopes_are_inbox_only(self):
+        session, _, _ = self.establish()
+        with self.at(self.client_state):
+            c.register_delivery(self.client["local_credential"], session["topic"])
+        for metadata in (self.task_metadata(), {"version": 999, "thread_id": "REMOTE TARGET"}):
+            packet = self.send(self.service_state, self.service, session["connection_id"])
+            body = {**packet[2], "task": metadata}
+            with self.at(self.service_state), c.registry() as data:
+                aid, agent = c._agent(data, self.service["local_credential"])
+                body = c._sign(agent, {key: value for key, value in body.items() if key != "signature"})
+            raw = relay.encrypt_payload_aes_gcm(body, packet[3], topic=packet[0])
+            self.runner.reset_mock()
+            self.deliver(self.client_state, (packet[0], raw, body, packet[3]))
+            self.runner.assert_not_called()
+        with self.at(self.client_state):
+            messages = c.inbox(self.client["local_credential"])
+            self.assertEqual(len(messages), 2)
+            self.assertEqual({value["task_applicability"] for value in messages}, {"unregistered", "unsupported_or_malformed"})
+            self.assertTrue(all(not c.read(self.client["local_credential"], value["id"], False)["task_execution_permitted"] for value in messages))
+
+    def test_task_legacy_capability_and_owner_filtered_status(self):
+        session, _, _ = self.establish()
+        other = self.register(self.client_state, "task-other")
+        with self.at(self.client_state):
+            with c.registry(write=True) as data:
+                data["topics"][session["topic"]].pop("peer_capabilities")
+            result = json.loads(tools.intercom_configure_task(self.client["local_credential"], session["connection_id"], "work", "participant", "coordinator"))
+            self.assertEqual(result["status"], "unsupported")
+            for operation in (lambda: c.connection_health(other["local_credential"], session["connection_id"]),
+                              lambda: c.task_status(other["local_credential"], session["connection_id"], "work")):
+                with self.assertRaises(ValueError):
+                    operation()
+
+    def test_sender_correlation_and_stage_diagnostics_do_not_expose_bodies_or_paths(self):
+        session, _, _ = self.establish()
+        with self.at(self.service_state):
+            result = json.loads(asyncio.run(tools.intercom_nostr_send_message(self.service["local_credential"], session["connection_id"], "SECRET BODY")))
+        packet = self.outgoing.pop(0)
+        self.deliver(self.client_state, packet)
+        with self.at(self.client_state):
+            message = c.inbox(self.client["local_credential"])[0]
+            self.assertNotEqual(result["message_id"], message["id"])
+            self.assertEqual(result["message_id"], message["source_message_id"])
+            self.assertEqual(result["sent_at"], message["sent_at"])
+            self.assertLessEqual(message["received_at"], message["persisted_at"])
+            c.read(self.client["local_credential"], message["id"])
+            health = c.connection_health(self.client["local_credential"], session["connection_id"])
+            self.assertIsNotNone(health["inbox_stages"][0]["read_at"])
+            self.assertNotIn("SECRET", json.dumps(health))
+            self.assertNotIn(self.client["workspace"], json.dumps(health))
 
     def test_one_invitation_ten_clients_have_independent_authenticated_sessions(self):
         clients = [self.client] + [self.register(self.client_state, "client-" + str(i)) for i in range(9)]
@@ -372,13 +643,113 @@ class PrivateConnectionTests(IsolatedStateTestCase):
                 self.assertNotIn(session["topic"], data["topics"])
                 self.assertEqual(data["connections"], {})
 
+    def test_expiry_removes_read_and_unread_data_and_preserves_other_chat(self):
+        session, _, _ = self.establish()
+        other = self.register(self.client_state, "other-history")
+        other_session, _, _ = self.establish(other)
+        removed = [self.store_message(self.client_state, session["topic"], read=value)
+                   for value in (False, True)]
+        preserved = self.store_message(self.client_state, other_session["topic"])
+        with self.at(self.client_state):
+            with c.registry(write=True) as data:
+                data["topics"][session["topic"]]["expires_at"] = "2000-01-01T00:00:00Z"
+            c.active_topics()  # The broker's periodic maintenance and restart path.
+            self.assertEqual(c.inbox(self.client["local_credential"], include_read=True), [])
+            self.assertEqual(len(c.inbox(other["local_credential"])), 1)
+        self.assertTrue(all(not path.exists() for pair in removed for path in pair))
+        self.assertTrue(all(path.exists() for path in preserved))
+
+    def test_revocation_removes_history_and_preserves_other_session_and_export(self):
+        session, _, _ = self.establish()
+        other_session, _, _ = self.establish()
+        removed = [self.store_message(self.client_state, session["topic"], read=value)
+                   for value in (False, True)]
+        preserved = self.store_message(self.client_state, other_session["topic"])
+        with self.at(self.client_state):
+            exported = json.loads(tools.intercom_unarm_attachment(
+                self.client["local_credential"], removed[0][0].stem))["path"]
+            tools.intercom_unpair(self.client["local_credential"], session["topic"])
+            self.assertEqual(len(c.inbox(self.client["local_credential"], include_read=True)), 1)
+        self.assertTrue(all(not path.exists() for pair in removed for path in pair))
+        self.assertTrue(all(path.exists() for path in preserved))
+        self.assertEqual(Path(exported).read_bytes(), b"attachment")
+
+    def test_registry_cleans_messages_orphaned_by_an_earlier_version(self):
+        session, _, _ = self.establish()
+        removed = self.store_message(self.client_state, session["topic"])
+        with self.at(self.client_state):
+            registry_path = Path(runtime.get_pairings_file_path())
+            data = json.loads(registry_path.read_text(encoding="utf-8"))
+            data["topics"].pop(session["topic"])
+            runtime.atomic_write_json(registry_path, data)
+            self.assertTrue(all(path.exists() for path in removed))
+            c.active_topics()
+            self.assertTrue(all(not path.exists() for path in removed))
+            with c.registry() as data:
+                self.assertEqual(data["connections"], {})
+
+    def test_cleanup_failure_preserves_registry_for_retry(self):
+        session, _, _ = self.establish()
+        envelope, attachment = self.store_message(self.client_state, session["topic"])
+        original = Path.unlink
+        def deny_attachment(path, *args, **kwargs):
+            if path == attachment:
+                raise PermissionError("attachment in use")
+            return original(path, *args, **kwargs)
+        with self.at(self.client_state):
+            with mock.patch.object(Path, "unlink", new=deny_attachment):
+                with self.assertRaises(RuntimeError):
+                    c.revoke(self.client["local_credential"], session["topic"])
+            self.assertTrue(envelope.exists())
+            self.assertTrue(attachment.exists())
+            self.assertIn(session["topic"], c.active_topics())
+            c.revoke(self.client["local_credential"], session["topic"])
+        self.assertFalse(envelope.exists())
+        self.assertFalse(attachment.exists())
+
+    def test_pairing_closed_during_delivery_cannot_commit_message_or_attachment(self):
+        for close in ("revoke", "expire"):
+            with self.subTest(close=close):
+                session, _, _ = self.establish()
+                with self.at(self.client_state), c.registry(write=True) as data:
+                    data["topics"][session["topic"]]["policy"]["accept_attachments"] = "allow"
+                share = Path(self.service["workspace"]) / ".intercom-share"
+                share.mkdir(exist_ok=True)
+                attachment = share / "during-delivery.txt"
+                attachment.write_bytes(b"attachment")
+                packet = self.send(self.service_state, self.service, session["connection_id"], attachment=str(attachment))
+                original = c.commit_message
+                def close_before_commit(*args, **kwargs):
+                    if close == "revoke":
+                        c.revoke(self.client["local_credential"], session["topic"])
+                    else:
+                        with c.registry(write=True) as data:
+                            data["topics"][session["topic"]]["expires_at"] = "2000-01-01T00:00:00Z"
+                    return original(*args, **kwargs)
+                self.runner.reset_mock()
+                with mock.patch.object(c, "commit_message", side_effect=close_before_commit), \
+                     mock.patch.object(runtime, "write_message_envelope") as writer:
+                    self.deliver(self.client_state, packet)
+                writer.assert_not_called()
+                self.runner.assert_not_called()
+                with self.at(self.client_state):
+                    endpoint = runtime.get_or_create_local_identity()["identity"]
+                    self.assertEqual(list(runtime.get_messages_dir(endpoint).glob("*.json")), [])
+                    self.assertEqual(list(runtime.get_attachment_dir(endpoint).rglob("*.disarmed")), [])
+
     def test_revoking_one_client_preserves_other_sessions_and_service_revoke_closes_all(self):
         second = self.register(self.client_state, "other-session")
         first_session, _, _ = self.establish()
         second_session, _, _ = self.establish(second)
+        first_topic = c._session_topic(self.invitation["topic"], first_session["connection_id"], "service")
+        second_topic = c._session_topic(self.invitation["topic"], second_session["connection_id"], "service")
+        first_files = self.store_message(self.service_state, first_topic)
+        second_files = self.store_message(self.service_state, second_topic, read=True)
         with self.at(self.service_state):
             topic = c._session_topic(self.invitation["topic"], first_session["connection_id"], "service")
             c.revoke(self.service["local_credential"], topic)
+        self.assertTrue(all(not path.exists() for path in first_files))
+        self.assertTrue(all(path.exists() for path in second_files))
         packet = self.send(self.service_state, self.service, second_session["connection_id"])
         self.deliver(self.client_state, packet)
         with self.at(self.service_state):
@@ -386,6 +757,7 @@ class PrivateConnectionTests(IsolatedStateTestCase):
             self.assertEqual(c.list_connections(self.service["local_credential"])["connections"], [])
             with self.assertRaises(ValueError):
                 asyncio.run(c.send(self.service["local_credential"], second_session["connection_id"], "closed"))
+        self.assertTrue(all(not path.exists() for path in second_files))
 
     def test_invalid_acceptance_cannot_activate_or_replace_client_key(self):
         session, request = self.request()
@@ -504,15 +876,18 @@ class PrivateConnectionTests(IsolatedStateTestCase):
         with self.at(self.client_state):
             c.register_delivery(self.client["local_credential"], session["topic"])
         packet = self.send(self.service_state, self.service, session["connection_id"])
-        original = runtime.write_message_envelope
+        original = c.commit_message
         def commit_then_revoke(*args, **kwargs):
             path = original(*args, **kwargs)
             c.revoke(self.client["local_credential"], session["topic"])
             return path
         self.runner.reset_mock()
-        with mock.patch.object(runtime, "write_message_envelope", side_effect=commit_then_revoke):
+        with mock.patch.object(c, "commit_message", side_effect=commit_then_revoke):
             self.deliver(self.client_state, packet)
         self.runner.assert_not_called()
+        with self.at(self.client_state):
+            endpoint = runtime.get_or_create_local_identity()["identity"]
+            self.assertEqual(list(runtime.get_messages_dir(endpoint).glob("*.json")), [])
 
     def test_unregister_serializes_with_inflight_queue_and_blocks_future_queue(self):
         session, _, _ = self.establish()
@@ -569,6 +944,81 @@ class PrivateConnectionTests(IsolatedStateTestCase):
         self.deliver(self.client_state, second)
         with self.at(self.client_state):
             self.assertEqual(len(c.inbox(self.client["local_credential"])), 2)
+
+    def test_antigravity_runtime_inbox_read_delete_and_unarm_attachment(self):
+        with self.at(self.client_state), mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "antigravity"}):
+            ag_client = self.register(self.client_state, "ag_client")
+            result = c.connect(ag_client["local_credential"], self.invitation["pairing_token"], "support_hotline",
+                               accept_attachments="allow", reply_mode="direct")
+            asyncio.run(c.pending_requests())
+        request = self.outgoing.pop(0)
+
+        with self.at(self.service_state):
+            asyncio.run(c.receive(request[0], request[1]))
+        acceptance = self.outgoing.pop(0)
+
+        with self.at(self.client_state), mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "antigravity"}):
+            asyncio.run(c.receive(acceptance[0], acceptance[1]))
+
+        session = result
+        share = Path(self.service["workspace"]) / ".intercom-share"
+        share.mkdir(exist_ok=True)
+        path = share / "sample.txt"
+        path.write_text("sample antigravity payload", encoding="utf-8")
+
+        packet = self.send(self.service_state, self.service, session["connection_id"], attachment=str(path))
+        packet2 = self.send(self.service_state, self.service, session["connection_id"], content="second message")
+
+        with self.at(self.client_state), mock.patch.dict(os.environ, {"INTERCOM_RUNTIME": "antigravity"}), \
+             mock.patch.object(relay.IntercomNotificationHandler, "_trigger_wakeup") as mock_wakeup:
+            self.deliver(self.client_state, packet)
+            self.deliver(self.client_state, packet2)
+            self.assertTrue(mock_wakeup.called)
+            self.assertEqual(mock_wakeup.call_count, 2)
+            recipient_id, notification_text = mock_wakeup.call_args_list[0][0]
+            self.assertEqual(recipient_id, ag_client["chat_id"])
+            self.assertIn("[INTERCOM INBOUND NOTIFICATION]", notification_text)
+            self.assertIn("Read only this message using intercom_read_message", notification_text)
+            self.assertNotIn("sample antigravity payload", notification_text)
+
+            messages = c.inbox(ag_client["local_credential"])
+            self.assertEqual(len(messages), 2)
+            att_msg = next(m for m in messages if m["has_attachment"])
+            txt_msg = next(m for m in messages if not m["has_attachment"])
+            mid = att_msg["id"]
+            mid2 = txt_msg["id"]
+
+            tool_received = json.loads(tools.intercom_receive_messages(ag_client["local_credential"]))
+            self.assertEqual(tool_received["messages"], messages)
+
+            read_payload = c.read(ag_client["local_credential"], mid, mark_read=False)
+            self.assertEqual(read_payload["id"], mid)
+            self.assertEqual(read_payload["content"], "hello")
+            self.assertTrue(read_payload["attachment"]["is_disarmed"])
+
+            tool_read_payload = json.loads(tools.intercom_read_message(ag_client["local_credential"], mid, mark_read=False))
+            self.assertEqual(tool_read_payload, read_payload)
+
+            tool_read2 = json.loads(tools.intercom_read_message(ag_client["local_credential"], mid2, mark_read=False))
+            self.assertEqual(tool_read2["content"], "second message")
+            self.assertFalse(tool_read2.get("attachment"))
+
+            extracted = json.loads(tools.intercom_unarm_attachment(ag_client["local_credential"], mid))
+            self.assertEqual(Path(extracted["path"]).read_text(), "sample antigravity payload")
+
+            tool_delete_res = json.loads(tools.intercom_delete_message(ag_client["local_credential"], mid2))
+            self.assertEqual(tool_delete_res, {"deleted": True})
+            self.assertEqual(len(c.inbox(ag_client["local_credential"])), 1)
+
+            deleted = c.delete(ag_client["local_credential"], mid)
+            self.assertTrue(deleted)
+            self.assertEqual(len(c.inbox(ag_client["local_credential"], include_read=True)), 0)
+            self.assertEqual(json.loads(tools.intercom_receive_messages(ag_client["local_credential"], include_read=True))["messages"], [])
+
+            removed = self.store_message(self.client_state, session["topic"])
+            c.revoke(ag_client["local_credential"], session["topic"])
+            self.assertTrue(all(not path.exists() for path in removed))
+            self.assertTrue(Path(extracted["path"]).exists())
 
 
 if __name__ == "__main__":

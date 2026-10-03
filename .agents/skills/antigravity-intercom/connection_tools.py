@@ -103,8 +103,65 @@ async def intercom_nostr_send_message(local_credential: str, connection_id: str,
     invitation transport. Attachment paths must be within this chat's configured
     share roots. Publication success does not prove the peer has read the message.
     """
-    event_id = await connections.send(local_credential, connection_id, content, attachment_path)
-    return _json({"status": "published", "event_id": event_id, "connection_id": connection_id})
+    return _json(await connections.send(local_credential, connection_id, content, attachment_path, details=True))
+
+
+def intercom_connection_health(local_credential: str, connection_id: str) -> str:
+    """Inspect only this owned connection's sanitized relay health and publication stages."""
+    return _json(connections.connection_health(local_credential, connection_id))
+
+
+def intercom_configure_task(local_credential: str, connection_id: str, task_id: str,
+        local_role: str, peer_role: str, allow_peer_control: bool = False, coalesce: bool = False,
+        additional_local_roles: list[str] | None = None, additional_peer_roles: list[str] | None = None) -> str:
+    """Opt this owned connection into a task using explicit local authority and notification choices.
+
+    Configure both endpoints independently. Exactly one endpoint must be assigned
+    coordinator. Peer pause/resume requires allow_peer_control. Roles/options are
+    immutable for this task. Configuration never broadens channel permissions.
+    """
+    return _json(connections.configure_task(local_credential, connection_id, task_id,
+                 local_role, peer_role, allow_peer_control, coalesce, additional_local_roles, additional_peer_roles))
+
+
+def intercom_task_status(local_credential: str, connection_id: str, task_id: str) -> str:
+    """Inspect an owned task's revisions, separate actor reports, pause and host limitations."""
+    return _json(connections.task_status(local_credential, connection_id, task_id))
+
+
+def intercom_accept_task(local_credential: str, connection_id: str, task_id: str,
+        instruction_id: str, revision: int, generation: int) -> str:
+    """Explicitly accept a CURRENT instruction locally before work; never sends an automatic acknowledgment.
+
+    Use its signed sender instruction UUID, not its local inbox UUID. Acceptance
+    does not change saved policy, sandbox or tool permissions.
+    """
+    return _json(connections.accept_task(local_credential, connection_id, task_id,
+                 instruction_id, revision, generation))
+
+
+def intercom_task_control(local_credential: str, connection_id: str, task_id: str, action: str) -> str:
+    """Explicit local pause/resume; persists a generation without sending to a peer.
+
+    Suppresses broker task notifications and gates subsequent reads/acceptance.
+    Does not stop running host operations. Resume requires a fresh instruction.
+    """
+    return _json(connections.task_control(local_credential, connection_id, task_id, action))
+
+
+async def intercom_send_task_message(local_credential: str, connection_id: str,
+        task: dict, content: str, attachment_path: str | None = None) -> str:
+    """Explicitly send a validated task envelope under the existing policy/attachment approvals.
+
+    Reports must correlate to the sender instruction UUID and exact revision and
+    generation. Semantic acceptance is an explicit agent decision, never inferred
+    from receipt/read, and cannot auto-reply on a report_to_user channel.
+    """
+    try:
+        return _json(await connections.send(local_credential, connection_id, content, attachment_path,
+                                           task=task, details=True))
+    except ValueError:
+        return _json({"status": "error", "code": "task_validation_or_applicability_failed", "automatic_retry": False})
 
 
 def intercom_receive_messages(local_credential: str, limit: int = 20,

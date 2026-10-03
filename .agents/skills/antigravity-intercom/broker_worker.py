@@ -63,6 +63,7 @@ def main():
         try:
             name = command["name"]
             if name == "_status":
+                import relay_health as health
                 relay_health = {}
                 if listener is not None and nostr_relay.ACTIVE_LISTENER_CLIENT is not None:
                     relays = asyncio.run(nostr_relay.ACTIVE_LISTENER_CLIENT.relays())
@@ -73,6 +74,7 @@ def main():
                     "listener": "disabled" if listener is None else ("running" if listener.is_alive() else "restarting"),
                     "topics": len(nostr_relay._listener_topics()),
                     "relays": relay_health,
+                    "relay_limits": health.snapshot(nostr_relay.DEFAULT_RELAYS),
                     "console": __import__("ctypes").windll.kernel32.GetConsoleWindow() if os.name == "nt" else 0,
                 }
             else:

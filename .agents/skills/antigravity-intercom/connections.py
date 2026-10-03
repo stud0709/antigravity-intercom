@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import time
 import uuid
+import copy
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -28,6 +29,8 @@ from cryptography.hazmat.primitives import hashes
 import nostr_relay as relay
 import runtime_adapter as runtime
 import codex_router
+import coordination
+import relay_health
 
 PROTOCOL = "intercom-private-session-v1"
 MAX_AGENTS = 256
@@ -105,6 +108,18 @@ def _live(entry):
     return expiration is None or _now() < relay._parse_expiration(expiration)
 
 
+def _purge_inactive_messages(data):
+    # Several authenticated chats may share an endpoint; preserve every live
+    # topic at that endpoint, not just the caller's topics.
+    endpoints = {agent["endpoint"] for agent in data["agents"].values()
+                 if agent["runtime"] == runtime.get_runtime()}
+    for endpoint in endpoints:
+        topics = {topic for topic, entry in data["topics"].items()
+                  if entry.get("protocol") == PROTOCOL
+                  and entry.get("local_conversation_id") == endpoint}
+        runtime.purge_inactive_connection_messages(endpoint, topics)
+
+
 @contextmanager
 def registry(write=False):
     """One existing pairing-registry lock; no duplicated secret registry."""
@@ -113,7 +128,7 @@ def registry(write=False):
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         if not isinstance(data, dict):
             raise ValueError("Invalid connection registry")
-        for section in ("agents", "topics", "connections", "pairings"):
+        for section in ("agents", "topics", "connections", "pairings", "tasks"):
             if not isinstance(data.setdefault(section, {}), dict):
                 raise ValueError("Invalid connection registry")
         changed = relay._migrate_legacy_registry_secrets(data)
@@ -128,12 +143,20 @@ def registry(write=False):
             if entry.get("topic") not in data["topics"]:
                 del data["connections"][cid]
                 changed = True
+        task_count = len(data["tasks"])
+        coordination.prune(data)
+        changed = changed or task_count != len(data["tasks"])
+        # Also remove data orphaned by expiry/revocation in earlier versions.
+        # Keep the registry and quota lock held through all file removals.
+        _purge_inactive_messages(data)
         try:
             yield data
         except BaseException:
             raise
         else:
             if write or changed:
+                coordination.prune(data)
+                _purge_inactive_messages(data)
                 runtime.atomic_write_json(path, data)
 
 
@@ -282,7 +305,7 @@ def connect(credential, token, policy, allow_permanent=False, **overrides):
             raise RuntimeError("Connection limit reached")
         request = _sign(agent, _body("connect", invitation=value["topic"], connection_id=cid,
                         client_sign_public=agent["sign_public"], client_exchange_public=_public(ephemeral),
-                        service_identity=_identity(value["service_sign_public"])))
+                        service_identity=_identity(value["service_sign_public"]), capabilities=[coordination.CAPABILITY]))
         transcript = {"request_hash": _digest(request), "connection_id": cid, "invitation": value["topic"]}
         response_key = _derive(ephemeral, value["service_exchange_public"], transcript, "response")
         data["topics"][topic] = _entry(aid, agent, policy, value["expires_at"], response_key, "session",
@@ -354,9 +377,9 @@ async def _subscribe(topic):
     """Subscribe before publishing control traffic on ephemeral relays."""
     client = relay.ACTIVE_LISTENER_CLIENT
     if client is not None and topic not in relay.ACTIVE_LISTENER_TOPICS:
-        import nostr_sdk
-        await client.subscribe(nostr_sdk.Filter().kind(nostr_sdk.Kind(relay.INTERCOM_KIND)).hashtags([topic]), None)
-        relay.ACTIVE_LISTENER_TOPICS.add(topic)
+        topics = active_topics()
+        await relay.subscribe_topics(client, topics)
+        relay.ACTIVE_LISTENER_TOPICS = topics
 
 
 async def pending_requests():
@@ -414,7 +437,8 @@ async def accept_control(topic, payload):
                     raise RuntimeError("Connection limit reached")
                 ephemeral = X25519PrivateKey.generate()
                 acceptance = _sign(agent, _body("accepted", **transcript,
-                           service_exchange_public=_public(ephemeral), client_sign_public=body["client_sign_public"]))
+                           service_exchange_public=_public(ephemeral), client_sign_public=body["client_sign_public"],
+                           capabilities=[coordination.CAPABILITY]))
                 final_transcript = {**transcript, "acceptance_hash": _digest(acceptance)}
                 key = _derive(ephemeral, body["client_exchange_public"], final_transcript, "client-to-service")
                 send_key = _derive(ephemeral, body["client_exchange_public"], final_transcript, "service-to-client")
@@ -422,7 +446,8 @@ async def accept_control(topic, payload):
                                 state="active", role="service", connection_id=cid, invitation=topic,
                                 peer_sign_public=body["client_sign_public"], remote_conversation_id=_identity(body["client_sign_public"]),
                                 acceptance=acceptance, transcript=transcript, relays=entry["relays"],
-                                send_key=runtime.protect_secret(_b64(send_key)), peer_topic=_session_topic(topic, cid))
+                                send_key=runtime.protect_secret(_b64(send_key)), peer_topic=_session_topic(topic, cid),
+                                peer_capabilities=_capabilities(body))
                 if entry.get("codex_delivery"):
                     session["codex_delivery"] = dict(entry["codex_delivery"])
                 data["topics"][new_topic] = session
@@ -441,6 +466,7 @@ async def accept_control(topic, payload):
             entry["send_key"] = runtime.protect_secret(_b64(send_key))
             entry["peer_topic"] = _session_topic(entry["invitation"], entry["connection_id"], "service")
             entry["state"] = "active"
+            entry["peer_capabilities"] = _capabilities(body)
             for name in ("bootstrap_key", "client_ephemeral", "request", "attempts", "next_attempt"):
                 entry.pop(name, None)
         elif entry.get("state") == "active":
@@ -458,6 +484,8 @@ async def accept_control(topic, payload):
             highest = max(sequence, highest)
             entry["receive_highest"] = highest
             entry["receive_seen"] = [seq for seq in seen if seq > highest - REPLAY_WINDOW] + [sequence]
+            if "capabilities" in body:
+                entry["peer_capabilities"] = _capabilities(body)
             # Routing is derived solely from the private local registration.
             return {**body, "recipient_conversation_id": agent["endpoint"]}, dict(entry)
     if response:
@@ -488,28 +516,223 @@ def _connection(data, credential, connection_id):
     return selected["topic"], agent, entry
 
 
-async def send(credential, connection_id, content, attachment_path=None):
+def _capabilities(body):
+    advertised = body.get("capabilities", [])
+    return [coordination.CAPABILITY] if isinstance(advertised, list) and coordination.CAPABILITY in advertised else []
+
+
+def configure_task(credential, connection_id, task_id, local_role, peer_role, allow_peer_control=False, coalesce=False,
+                   additional_local_roles=None, additional_peer_roles=None):
+    with registry(write=True) as data:
+        topic, _, entry = _connection(data, credential, connection_id)
+        if coordination.CAPABILITY not in entry.get("peer_capabilities", []):
+            return {"status": "unsupported", "capability": coordination.CAPABILITY,
+                    "generic_messaging": True}
+        record = coordination.configure(data, {**entry, "topic": topic}, task_id,
+                                         local_role, peer_role, allow_peer_control, coalesce,
+                                         additional_local_roles, additional_peer_roles)
+        return coordination.public(record)
+
+
+def task_status(credential, connection_id, task_id):
+    with registry() as data:
+        topic, agent, entry = _connection(data, credential, connection_id)
+        record = coordination.lookup(data, entry, task_id)
+        if record is None:
+            raise ValueError("Task is not locally registered")
+        status = coordination.public(record)
+        messages = []
+        for path in runtime.get_messages_dir(agent["endpoint"], create=False).glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (isinstance(payload, dict) and payload.get("topic") == topic
+                    and isinstance(payload.get("task"), dict) and payload["task"].get("task_id") == task_id):
+                applicability = coordination.applicability(record, payload["task"])
+                if payload.get("task_status", "current") not in ("current", "conflict"):
+                    applicability = payload["task_status"]
+                messages.append({"id": payload["id"], "source_message_id": payload.get("source_message_id"),
+                                 "kind": payload["task"]["kind"], "revision": payload["task"]["revision"],
+                                 "generation": payload["task"]["generation"], "applicability": applicability,
+                                 "received_at": payload.get("received_at"), "read_at": payload.get("read_at")})
+        status["inbox_messages"] = sorted(messages, key=lambda value: value.get("received_at") or "", reverse=True)[:32]
+        status["semantic_acceptance_pending"] = [side for side in ("local", "peer") if side not in record["accepted"]]
+        return status
+
+
+def accept_task(credential, connection_id, task_id, instruction_id, revision, generation):
+    """Record explicit LOCAL semantic acceptance; this operation never sends."""
+    with registry(write=True) as data:
+        _, _, entry = _connection(data, credential, connection_id)
+        record = coordination.lookup(data, entry, task_id)
+        if record is None or record["instruction"] is None:
+            raise ValueError("Task has no current instruction")
+        metadata = coordination.validate({"version": 1, "task_id": task_id, "kind": "accepted",
+            "revision": revision, "generation": generation, "in_reply_to": instruction_id,
+            "items": record["instruction"]["items"], "baseline": record["instruction"]["baseline"]})
+        acceptance_id = str(uuid.uuid4())
+        result = coordination.apply(record, metadata, acceptance_id, "local", content_digest=hashlib.sha256(b"").hexdigest())
+        if result != "current":
+            raise ValueError("Instruction cannot be accepted: " + result)
+        coordination.remember(record, metadata, acceptance_id, "local", result)
+        return {"status": "accepted_locally", "acceptance_id": acceptance_id,
+                "sent_to_peer": False, "task": coordination.public(record)}
+
+
+def task_control(credential, connection_id, task_id, action):
+    if action not in ("pause", "resume"):
+        raise ValueError("Task control must be pause or resume")
+    with registry(write=True) as data:
+        _, _, entry = _connection(data, credential, connection_id)
+        record = coordination.lookup(data, entry, task_id)
+        if record is None:
+            raise ValueError("Task is not locally registered")
+        record.update(paused=action == "pause", generation=record["generation"] + 1, pending=[])
+        # A local participant interruption is a local gate; remote resume cannot
+        # bypass it. Only this authenticated local control operation clears it.
+        record["local_pause"] = action == "pause"
+        return coordination.public(record)
+
+
+def connection_health(credential, connection_id):
+    with registry() as data:
+        topic, agent, entry = _connection(data, credential, connection_id)
+        stages = []
+        for path in runtime.get_messages_dir(agent["endpoint"], create=False).glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("topic") == topic:
+                stages.append({key: payload.get(key) for key in
+                    ("id", "source_message_id", "sent_at", "received_at", "persisted_at", "read_at")})
+        return {"relays": relay_health.snapshot(entry["relays"]),
+                "publication": copy.deepcopy(entry.get("publications", [])),
+                "wakeup": copy.deepcopy(entry.get("deliveries", [])),
+                "inbox_stages": sorted(stages, key=lambda value: value.get("received_at") or "", reverse=True)[:32],
+                "peer_capabilities": entry.get("peer_capabilities", []),
+                "remote_receipt": "unknown"}
+
+
+async def send(credential, connection_id, content, attachment_path=None, *, task=None, details=False):
+    message_id = str(uuid.uuid4())
+    attempt_at, started = _now().isoformat(), time.monotonic()
     with registry(write=True) as data:
         topic, agent, entry = _connection(data, credential, connection_id)
+        local_topic = topic
+        if task is not None:
+            task = coordination.validate(task)
+            record = coordination.lookup(data, entry, task["task_id"])
+            if record is None or coordination.CAPABILITY not in entry.get("peer_capabilities", []):
+                raise ValueError("Task protocol is not locally configured/supported")
+            if entry["policy"]["reply_mode"] != "direct" and task["kind"] == "accepted":
+                raise ValueError("Semantic acceptance cannot send an automatic reply under report_to_user")
+            candidate = copy.deepcopy(record)
+            result = coordination.apply(candidate, task, message_id, "local",
+                                         content_digest=hashlib.sha256(content.encode("utf-8")).hexdigest())
+            permitted = ("paused", "awaiting_instruction") if task["kind"] in ("pause", "resume") else ("current",)
+            if result not in permitted:
+                raise ValueError("Task operation is not applicable: " + result)
+            coordination.remember(candidate, task, message_id, "local", result)
+            data["tasks"][coordination.key(entry["owner_agent"], connection_id, task["task_id"])] = candidate
         sequence = entry.get("send_sequence", 0) + 1
         entry["send_sequence"] = sequence
+        entry["publications"] = (entry.get("publications", []) + [{"message_id": message_id,
+            "attempt_at": attempt_at, "result": "pending", "remote_receipt": "unknown"}])[-32:]
         # Snapshot contains private broker state only; no caller supplies identity.
         agent, entry = dict(agent), dict(entry)
     send_entry = {**entry, "preshared_key": entry["send_key"]}
     topic = entry["peer_topic"]
-    return await asyncio.wait_for(relay._async_publish(_identity(agent["sign_public"]), entry["remote_conversation_id"],
-        content, attachment_path, topic, entry["relays"], connection=send_entry,
-        sign_payload=lambda body: _sign(agent, {**body, "protocol": PROTOCOL,
-                            "connection_id": entry["connection_id"], "topic": topic, "sequence": sequence}),
-        attachment_root=Path(agent["workspace"]) / ".intercom-share"), timeout=20)
+    result = {"message_id": message_id, "connection_id": connection_id, "attempt_at": attempt_at,
+              "remote_receipt": "unknown", "automatic_retry": False}
+    def signed(body):
+        result["sent_at"] = body["timestamp"]
+        return _sign(agent, {**body, "protocol": PROTOCOL, "connection_id": entry["connection_id"],
+                             "topic": topic, "sequence": sequence, "capabilities": [coordination.CAPABILITY]})
+    try:
+        event_id = await asyncio.wait_for(relay._async_publish(_identity(agent["sign_public"]), entry["remote_conversation_id"],
+            content, attachment_path, topic, entry["relays"], connection=send_entry,
+            sign_payload=signed,
+            attachment_root=Path(agent["workspace"]) / ".intercom-share", message_id=message_id, task=task), timeout=20)
+        result.update(status="published", event_id=event_id)
+    except asyncio.TimeoutError:
+        error = relay_health.PublishError("publication_unknown", outcome="unknown")
+        result.update(error.result())
+        if not details:
+            raise error from None
+    except relay_health.PublishError as error:
+        result.update(error.result())
+        if not details:
+            raise
+    finally:
+        result.update(result_at=_now().isoformat(), elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+        with registry(write=True) as data:
+            selected = data["topics"].get(local_topic)
+            if selected and selected.get("owner_agent") == entry["owner_agent"]:
+                for publication in selected.get("publications", []):
+                    if publication["message_id"] == message_id:
+                        publication.update(result=result.get("status", "failed"), result_at=result["result_at"],
+                                           elapsed_ms=result["elapsed_ms"], code=result.get("code"), sent_at=result.get("sent_at"))
+    return result if details else event_id
+
+
+def commit_message(endpoint, payload, **attachment_options):
+    """Recheck the authenticated session under the inbox lock before committing."""
+    with registry(write=True) as data:
+        entry = data["topics"].get(payload.get("topic"))
+        if (not entry or entry.get("protocol") != PROTOCOL
+                or entry.get("state") != "active"
+                or entry.get("local_conversation_id") != endpoint
+                or entry.get("connection_id") != payload.get("connection_id")
+                or payload.get("recipient") != endpoint):
+            raise ValueError("Inbound connection is no longer active")
+        candidate = None
+        if "task" in payload:
+            try:
+                metadata = coordination.validate(payload["task"])
+                record = coordination.lookup(data, entry, metadata["task_id"])
+                if record is None:
+                    payload["task_status"] = "unregistered"
+                else:
+                    candidate = copy.deepcopy(record)
+                    payload["task_status"] = coordination.apply(candidate, metadata,
+                        payload["source_message_id"], "peer",
+                        content_digest=hashlib.sha256(payload["content"].encode("utf-8")).hexdigest())
+                    coordination.remember(candidate, metadata, payload["source_message_id"], "peer", payload["task_status"])
+                payload["task"] = metadata
+            except (ValueError, TypeError, KeyError):
+                payload.pop("task", None)
+                payload["task_status"] = "unsupported_or_malformed"
+        payload.setdefault("received_at", _now().isoformat(timespec="microseconds"))
+        payload["persisted_at"] = _now().isoformat(timespec="microseconds")
+        path = runtime.write_message_envelope(endpoint, payload, **attachment_options)
+        payload["persisted_at"] = _now().isoformat(timespec="microseconds")
+        runtime.atomic_write_json(Path(path), payload)
+        if candidate is not None:
+            data["tasks"][coordination.key(entry["owner_agent"], entry["connection_id"], candidate["task_id"])] = candidate
+        return path
 
 
 def read(credential, message_id, mark_read=True):
     with registry() as data:
         _, agent = _agent(data, credential)
         payload = runtime.read_inbox_message(agent["endpoint"], message_id, mark_read=False)
-        _owned(data, credential, payload.get("topic"))
-        return runtime.read_inbox_message(agent["endpoint"], message_id, mark_read=mark_read)
+        _, _, entry = _owned(data, credential, payload.get("topic"))
+        payload = runtime.read_inbox_message(agent["endpoint"], message_id, mark_read=mark_read)
+        if "task" in payload:
+            record = coordination.lookup(data, entry, payload["task"]["task_id"])
+            payload["task_applicability"] = coordination.applicability(record, payload["task"])
+            if payload.get("task_status", "current") not in ("current", "conflict"):
+                payload["task_applicability"] = payload["task_status"]
+            payload["task_work_applicable"] = (payload["task_applicability"] == "current"
+                and record is not None and "local" in record["accepted"])
+            payload["task_execution_permitted"] = payload["task_work_applicable"] and entry["policy"]["local_ops"] == "full"
+            payload["host_execution_cancellation"] = False
+        elif "task_status" in payload:
+            payload["task_applicability"] = payload["task_status"]
+            payload["task_execution_permitted"] = False
+        return payload
 
 
 def inbox(credential, limit=20, include_read=False):
@@ -528,7 +751,16 @@ def inbox(credential, limit=20, include_read=False):
                 continue
             if payload.get("topic") in topics and (include_read or not payload.get("read_at")):
                 metadata = {key: payload.get(key) for key in (
-                    "id", "connection_id", "topic", "sender", "timestamp", "read_at")}
+                    "id", "connection_id", "topic", "sender", "timestamp", "read_at", "source_message_id", "sent_at", "received_at", "persisted_at")}
+                if "task" in payload:
+                    entry = data["topics"][payload["topic"]]
+                    metadata["task"] = {key: payload["task"][key] for key in ("task_id", "kind", "revision", "generation")}
+                    metadata["task_applicability"] = coordination.applicability(
+                        coordination.lookup(data, entry, payload["task"]["task_id"]), payload["task"])
+                    if payload.get("task_status", "current") not in ("current", "conflict"):
+                        metadata["task_applicability"] = payload["task_status"]
+                elif "task_status" in payload:
+                    metadata["task_applicability"] = payload["task_status"]
                 metadata.update(has_attachment=bool(payload.get("attachment")), attachment_failed=bool(payload.get("attachment_error")))
                 messages.append(metadata)
         return sorted(messages, key=lambda item: item.get("timestamp", ""), reverse=True)[:limit]
@@ -542,29 +774,114 @@ def delete(credential, message_id):
         return runtime.delete_inbox_message(agent["endpoint"], message_id)
 
 
+def _notification_payload(data, entry, endpoint, message_id):
+    if any(message_id in attempt["message_ids"] for attempt in entry.get("deliveries", [])):
+        return None
+    payload = runtime.read_inbox_message(endpoint, message_id, mark_read=False)
+    if (payload.get("topic") != entry["topic"] or payload.get("connection_id") != entry["connection_id"]
+            or payload.get("recipient") != endpoint or payload.get("type") != "message"
+            or payload.get("read_at") or payload.get("policy") != entry["policy"]):
+        return None
+    if "task_status" in payload:
+        if "task" not in payload or payload["task_status"] not in ("current", "conflict"):
+            return None
+        metadata = payload["task"]
+        if coordination.applicability(coordination.lookup(data, entry, metadata["task_id"]), metadata) not in ("current", "conflict"):
+            return None
+    return payload
+
+
+def _notify_locked(data, topic, endpoint, message_ids):
+    entry = data["topics"].get(topic)
+    if not entry or entry.get("protocol") != PROTOCOL or entry.get("state") != "active":
+        return False
+    entry = {**entry, "topic": topic}
+    agent = data["agents"][entry["owner_agent"]]
+    policy = codex_router._policy(entry["policy"])
+    if policy["wakeup"] != "on" or agent["endpoint"] != endpoint or agent["runtime"] != runtime.get_runtime():
+        return False
+    if runtime.get_runtime() == "codex":
+        if entry.get("codex_delivery") != {"runtime": "codex", "thread_id": agent["chat_id"], "workspace": agent["workspace"], "endpoint": endpoint}:
+            return False
+    elif not runtime.is_antigravity_runtime():
+        return False
+    selected = []
+    for message_id in message_ids[:coordination.MAX_PENDING]:
+        try:
+            payload = _notification_payload(data, entry, endpoint, message_id)
+        except (FileNotFoundError, RuntimeError):
+            continue
+        if payload:
+            selected.append(payload)
+    if not selected:
+        return False
+    started = time.monotonic()
+    diagnostics = data["topics"][topic].setdefault("deliveries", [])
+    attempt = {"message_ids": [payload["id"] for payload in selected], "requested_at": _now().isoformat(),
+               "status": "pending", "host_started_at": None}
+    diagnostics.append(attempt)
+    del diagnostics[:-32]
+    prompt = codex_router.notification_batch(attempt["message_ids"], policy)
+    try:
+        # Persist consumption before a host call whose outcome may be unknown.
+        runtime.atomic_write_json(Path(runtime.get_pairings_file_path()), data)
+        if runtime.get_runtime() == "codex":
+            codex_router._run([codex_router._command(), "queue", "--thread", _uuid(agent["chat_id"]),
+                     "--message", prompt, "--cd", agent["workspace"]], Path(agent["workspace"]))
+        else:
+            confirmed = relay.IntercomNotificationHandler()._trigger_wakeup(endpoint, prompt)
+            if confirmed is False:
+                raise RuntimeError("Host notification not confirmed")
+        attempt["status"] = "requested"
+        return True
+    except Exception as exc:
+        attempt["status"] = "unknown"
+        relay.log_debug(f"[Connections] Notification not confirmed ({type(exc).__name__}); inbox retained.")
+        return False
+    finally:
+        attempt.update(result_at=_now().isoformat(), elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+
+
 def wake(topic, endpoint, message_id):
     if runtime.get_runtime() != "codex":
         return False
     try:
-        with registry() as data:
-            entry = data["topics"].get(topic)
-            if not entry or entry.get("protocol") != PROTOCOL or entry.get("state") != "active":
-                return False
-            agent = data["agents"][entry["owner_agent"]]
-            binding = entry.get("codex_delivery")
-            policy = codex_router._policy(entry["policy"])
-            if policy["wakeup"] != "on" or not binding or agent["runtime"] != "codex" or agent["endpoint"] != endpoint:
-                return False
-            if binding != {"runtime": "codex", "thread_id": agent["chat_id"], "workspace": agent["workspace"], "endpoint": endpoint}:
-                return False
-            payload = runtime.read_inbox_message(endpoint, message_id, mark_read=False)
-            if (payload.get("topic") != topic or payload.get("connection_id") != entry["connection_id"]
-                    or payload.get("recipient") != endpoint or payload.get("type") != "message"
-                    or payload.get("read_at") or payload.get("policy") != policy):
-                return False
-            codex_router._run([codex_router._command(), "queue", "--thread", _uuid(agent["chat_id"]),
-                    "--message", codex_router.notification(message_id, policy), "--cd", agent["workspace"]], Path(agent["workspace"]))
-        return True
-    except Exception as exc:
-        relay.log_debug(f"[Connections] Notification not confirmed ({type(exc).__name__}); inbox retained.")
+        with registry(write=True) as data:
+            return _notify_locked(data, topic, endpoint, [message_id])
+    except Exception:
         return False
+
+
+def notify(topic, endpoint, message_id):
+    try:
+        with registry(write=True) as data:
+            entry = data["topics"].get(topic)
+            if not entry:
+                return False
+            payload = _notification_payload(data, {**entry, "topic": topic}, endpoint, message_id)
+            if payload is None:
+                return False
+            if "task" in payload:
+                record = coordination.lookup(data, entry, payload["task"]["task_id"])
+                if record and not coordination.schedule(record, payload["task"], message_id):
+                    return False
+                if record and record["pending"]:
+                    batch = [message_id] + record["pending"]
+                    if len(batch) > coordination.MAX_PENDING:
+                        _notify_locked(data, topic, endpoint, [message_id])
+                        batch = record["pending"]
+                    record["pending"] = []
+                    return _notify_locked(data, topic, endpoint, batch)
+            return _notify_locked(data, topic, endpoint, [message_id])
+    except Exception:
+        return False
+
+
+def flush_notifications():
+    with registry(write=True) as data:
+        for record in data["tasks"].values():
+            if record["pending"] and time.time() >= record.get("pending_due", 0):
+                pending, record["pending"] = record["pending"], []
+                entry = data["topics"].get(record["topic"])
+                if entry:
+                    _notify_locked(data, record["topic"], entry["local_conversation_id"], pending)

@@ -87,7 +87,44 @@ for a different chat workspace; they are never broadened by a peer request.
 Unregistering a service invitation removes wakeups for its derived sessions.
 Revoking it closes all its local sessions. Revoking one client session does not
 affect other clients. Expiry removes session keys, connection mappings and
-delivery bindings. Established identities/bindings survive broker restarts.
+delivery bindings. Both expiry and local revocation remove the affected
+pairing's received envelopes and managed attachments, including unread data,
+under the registry/quota lock. Registry maintenance also purges messages left
+orphaned by earlier versions. Inbound commits recheck the session while holding
+that lock, so a delivery already in progress cannot recreate revoked inbox
+data. User-exported copies in `.intercom-share` remain user-managed.
+Established identities/bindings survive broker restarts.
+
+## Relay health and task coordination
+
+NIP-11 discovery uses the validated relay's HTTPS endpoint, bounded responses,
+three-second timeouts and a fifteen-minute cache. Publication checks actual
+signed/encrypted WebSocket frame bytes and advertised content limits. No size
+floor overrides a smaller relay limit. Inline attachments that cannot fit use
+the existing encrypted Blossom format; text is never truncated. Healthy relays
+can still accept an event when others are cooling down. Rate-limit/access
+warnings create bounded persistent per-relay cooldowns in the worker's isolated
+state. Neither warnings nor metadata broaden configured hosts or permissions.
+Application messages are not automatically resent. Operator diagnostics expose
+normalized categories, limits and retry intervals, never raw server warnings.
+
+`intercom_connection_health(local_credential, connection_id)` filters diagnostics
+to an owned connection. Send results retain publication status and now include
+the sender message UUID and attempt/result timing. Inbox records separately
+retain `source_message_id`, signed `sent_at`, local `received_at`, durable
+`persisted_at`, and `read_at`. Host wakeup request/result timing is recorded in
+the registry; host execution start and remote receipt remain unknown. Compare
+cross-host wall clocks only with clock-skew caveats. Elapsed publication/wakeup
+durations use local monotonic clocks. Bodies, credentials and absolute workspace
+paths are excluded from diagnostics.
+
+Signed handshakes and upgraded application messages advertise `tasks-v1` as
+protocol support only. Task roles, options and permission for peer control stay
+local and are not advertised. Older peers retain generic messaging. Each owned
+connection must opt into a task locally before typed instructions can apply.
+The bounded task state is stored in the existing locked registry and removed
+with its pairing. See [COORDINATION.md](COORDINATION.md) for the contract,
+coalescing behavior, explicit acceptance and pause limitations.
 
 ## Trust and upgrade
 

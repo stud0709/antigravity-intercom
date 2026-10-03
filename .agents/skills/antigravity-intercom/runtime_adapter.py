@@ -491,6 +491,32 @@ def _delete_message_files_locked(
         ) from exc
 
 
+def purge_inactive_connection_messages(recipient_id: str, active_topics: set[str]) -> None:
+    """Remove private-session inbox data whose local pairing no longer exists.
+
+    This is pairing lifecycle cleanup, including unread data, rather than quota
+    retention. Legacy or unrelated envelopes are not selected.
+    """
+    messages_dir, attachments_dir = _endpoint_paths(recipient_id)
+    with registry_lock():
+        for path in messages_dir.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("connection_id"), str)
+                or not payload["connection_id"]
+                or not isinstance(payload.get("topic"), str)
+                or payload["topic"] in active_topics
+                or payload.get("recipient") != recipient_id
+                or payload.get("id") != path.stem
+            ):
+                continue
+            _delete_message_files_locked(messages_dir, attachments_dir, path, payload)
+
+
 def _plan_read_messages_for_capacity(
     recipient_id: str,
     additional_bytes: int,
@@ -804,8 +830,6 @@ def list_inbox_messages(
 ) -> list[dict[str, Any]]:
     """List metadata only; message bodies require an explicit read by ID."""
 
-    if is_antigravity_runtime():
-        raise RuntimeError("intercom_receive_messages is available only in generic/inbox MCP runtimes (non-Antigravity).")
     if not 1 <= int(limit) <= 100:
         raise ValueError("limit must be between 1 and 100.")
 
@@ -850,8 +874,6 @@ def read_inbox_message(
 ) -> dict[str, Any]:
     """Read one explicitly selected message from the local inbox."""
 
-    if is_antigravity_runtime():
-        raise RuntimeError("intercom_read_message is available only in generic/inbox MCP runtimes (non-Antigravity).")
     message_id = validate_identity(message_id, "message_id")
     path = get_messages_dir(recipient_id, create=True) / f"{message_id}.json"
     with registry_lock():
@@ -877,8 +899,6 @@ def read_inbox_message(
 def delete_inbox_message(recipient_id: str, message_id: str) -> bool:
     """Delete one selected envelope and its locally managed attachment."""
 
-    if is_antigravity_runtime():
-        raise RuntimeError("intercom_delete_message is available only in generic/inbox MCP runtimes (non-Antigravity).")
     message_id = validate_identity(message_id, "message_id")
     messages_dir, attachments_dir = _endpoint_paths(recipient_id)
     path = messages_dir / f"{message_id}.json"
