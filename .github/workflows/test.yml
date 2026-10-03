@@ -30,3 +30,9 @@ jobs:
           .agents/skills/antigravity-intercom/nostr_relay.py
           .agents/skills/antigravity-intercom/nostr_listener.py
           .agents/skills/antigravity-intercom/server.py
+          .agents/skills/antigravity-intercom/connections.py
+          .agents/skills/antigravity-intercom/connection_tools.py
+          .agents/skills/antigravity-intercom/codex_router.py
+          .agents/skills/antigravity-intercom/broker.py
+          .agents/skills/antigravity-intercom/broker_rpc.py
+          .agents/skills/antigravity-intercom/broker_worker.py

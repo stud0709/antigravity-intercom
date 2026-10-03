@@ -1,7 +1,7 @@
 [mcp_servers.antigravity_intercom]
-command = ".venv/Scripts/python.exe"
-args = [".agents/skills/antigravity-intercom/server.py"]
-cwd = "."
+# Configure absolute command, args, and cwd in the selected Codex home's config.toml.
+# The shared app-server daemon can launch MCP servers outside the repository.
+env_vars = ["CODEX_HOME"]
 enabled = true
 required = false
 startup_timeout_sec = 20
@@ -22,4 +22,13 @@ approval_mode = "approve"
 approval_mode = "prompt"
 
 [mcp_servers.antigravity_intercom.tools.intercom_delete_message]
+approval_mode = "prompt"
+
+[mcp_servers.antigravity_intercom.tools.intercom_register_codex_thread]
+approval_mode = "approve"
+
+[mcp_servers.antigravity_intercom.tools.intercom_inspect_pairing_token]
+approval_mode = "approve"
+
+[mcp_servers.antigravity_intercom.tools.intercom_unregister_codex_thread]
 approval_mode = "prompt"

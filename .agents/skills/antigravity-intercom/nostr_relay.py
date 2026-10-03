@@ -197,7 +197,7 @@ def get_default_topic():
     env_topic = os.environ.get("ANTIGRAVITY_INTERCOM_TOPIC")
     if env_topic:
         return sanitize_topic(env_topic)
-        
+
     try:
         config_path = os.path.expanduser("~/.gemini/config/mcp_config.json")
         if os.path.exists(config_path):
@@ -209,21 +209,14 @@ def get_default_topic():
                     return sanitize_topic(file_topic)
     except Exception:
         pass
-        
+
     return "antigravity_intercom"
 
 
 def _legacy_plaintext_allowed(event_topic: str, psk_bytes: bytes | None) -> bool:
-    return (
-        runtime_adapter.is_antigravity_runtime()
-        and os.environ.get("INTERCOM_ALLOW_LEGACY_PLAINTEXT") == "1"
-        and not psk_bytes
-        and sanitize_topic(event_topic) == get_default_topic()
-    )
+    # No supported runtime accepts earlier plaintext contracts.
+    return False
 
-# ---------------------------------------------------------------------------
-# Pairing Registry, TTL & Stale Conversation Pruning
-# ---------------------------------------------------------------------------
 
 def get_pairings_file_path() -> str:
     return runtime_adapter.get_pairings_file_path()
@@ -237,12 +230,12 @@ def prune_stale_pairings(data: dict) -> tuple[dict, bool]:
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     changed = False
-    
+
     pairings = data.get("pairings", {})
     topics = data.get("topics", {})
-    
+
     stale_recipients = []
-    
+
     for r_id, p_info in list(pairings.items()):
         # 1. Check TTL Expiration
         exp_str = p_info.get("expires_at")
@@ -259,7 +252,7 @@ def prune_stale_pairings(data: dict) -> tuple[dict, bool]:
                 stale_recipients.append(r_id)
                 changed = True
                 continue
-                
+
         # 2. Check if local conversation folder exists
         local_id = p_info.get("local_conversation_id")
         if (
@@ -277,14 +270,14 @@ def prune_stale_pairings(data: dict) -> tuple[dict, bool]:
                 stale_recipients.append(r_id)
                 changed = True
                 continue
-                
+
     for r_id in stale_recipients:
         p_info = pairings.pop(r_id, None)
         if p_info:
             topic = p_info.get("topic")
             if topic and topic in topics:
                 topics.pop(topic, None)
-                
+
     # Also prune any orphan or expired topics
     for t_name, t_info in list(topics.items()):
         exp_str = t_info.get("expires_at")
@@ -297,7 +290,7 @@ def prune_stale_pairings(data: dict) -> tuple[dict, bool]:
             except ValueError:
                 topics.pop(t_name, None)
                 changed = True
-                
+
     data["pairings"] = pairings
     data["topics"] = topics
     return data, changed
@@ -401,14 +394,14 @@ def save_pairing(
                     data = json.load(f)
             except Exception:
                 pass
-                
+
         if "pairings" not in data:
             data["pairings"] = {}
         if "topics" not in data:
             data["topics"] = {}
-            
+
         now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        
+
         pairing_entry = {
             "remote_conversation_id": remote_conversation_id,
             "local_conversation_id": local_conversation_id,
@@ -421,7 +414,7 @@ def save_pairing(
             pairing_entry["expires_at"] = expires_at
         if policy:
             pairing_entry["policy"] = policy
-            
+
         # Only replace pending or alias placeholders once the peer ID is known.
         # Do not evict valid paired conversations that share the same topic channel.
         for existing_id, existing in list(data["pairings"].items()):
@@ -430,7 +423,7 @@ def save_pairing(
                     data["pairings"].pop(existing_id, None)
 
         data["pairings"][remote_conversation_id] = pairing_entry
-        
+
         topic_entry = {
             "topic": topic,
             "preshared_key": stored_psk,
@@ -442,25 +435,40 @@ def save_pairing(
             topic_entry["expires_at"] = expires_at
         if policy:
             topic_entry["policy"] = policy
-            
+
+        # Completing a handshake may replace a pending peer but must retain its
+        # local delivery consent. A different key, endpoint, TTL, or policy must
+        # be registered again rather than inheriting that consent.
+        previous_topic = data["topics"].get(topic, {})
+        if (previous_topic.get("local_conversation_id") == local_conversation_id
+                and previous_topic.get("expires_at") == expires_at
+                and previous_topic.get("policy") == policy
+                and isinstance(previous_topic.get("codex_delivery"), dict)):
+            try:
+                same_key = _decode_stored_psk(previous_topic.get("preshared_key", "")) == _decode_psk(psk_b64)
+            except ValueError:
+                same_key = False
+            if same_key:
+                topic_entry["codex_delivery"] = previous_topic["codex_delivery"]
+
         data["topics"][topic] = topic_entry
-        
+
         cleaned_data, _ = prune_stale_pairings(data)
         runtime_adapter.atomic_write_json(file_path, cleaned_data)
-            
+
         ttl_info = f" (Expires at {expires_at})" if expires_at else ""
         log_debug(f"[Pairings] Saved pairing for recipient '{remote_conversation_id}' on topic '{topic}'{ttl_info}")
 
 def get_pairing_for_recipient(recipient_id: str, sender_id: str = "") -> dict:
     data = load_pairings()
     pairings = data.get("pairings", {})
-    
+
     # 1. Direct lookup by recipient_id
     if recipient_id in pairings:
         p = pairings[recipient_id]
         if not sender_id or p.get("local_conversation_id") == sender_id:
             return p
-            
+
     # 2. Lookup matching (local=sender_id, remote=recipient_id) or reverse pair
     for p in pairings.values():
         if p.get("remote_conversation_id") == recipient_id:
@@ -468,7 +476,7 @@ def get_pairing_for_recipient(recipient_id: str, sender_id: str = "") -> dict:
                 return p
         if sender_id and p.get("local_conversation_id") == recipient_id and p.get("remote_conversation_id") == sender_id:
             return p
-            
+
     # 3. Topic fallback lookup
     if not sender_id:
         for t in data.get("topics", {}).values():
@@ -479,7 +487,7 @@ def get_pairing_for_recipient(recipient_id: str, sender_id: str = "") -> dict:
             if (t.get("remote_conversation_id") == recipient_id and t.get("local_conversation_id") == sender_id) or \
                (t.get("local_conversation_id") == recipient_id and t.get("remote_conversation_id") == sender_id):
                 return t
-            
+
     return None
 
 
@@ -548,7 +556,7 @@ def get_psk_for_topic(topic: str) -> bytes:
             return _decode_stored_psk(topic_info["preshared_key"])
         except ValueError:
             pass
-            
+
     # Check pairings values as fallback
     for p in data.get("pairings", {}).values():
         if p.get("topic") == topic and "preshared_key" in p:
@@ -709,188 +717,6 @@ def normalize_policy(
     return base
 
 
-def generate_pairing_token(
-    local_conversation_id: str,
-    recipient_hint: str = "",
-    ttl_hours: float = 24.0,
-    policy: str | dict | None = None,
-    policy_preset: str | None = None,
-    **policy_overrides,
-) -> str:
-    local_conversation_id = runtime_adapter.validate_identity(
-        local_conversation_id, "local_conversation_id"
-    )
-    recipient_hint = (recipient_hint or "").strip()
-    if len(recipient_hint) > 200:
-        raise ValueError("recipient_hint must not exceed 200 characters.")
-    try:
-        ttl_hours = float(ttl_hours)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("ttl_hours must be a number.") from exc
-    if not math.isfinite(ttl_hours) or ttl_hours < 0 or ttl_hours > MAX_TTL_HOURS:
-        raise ValueError(f"ttl_hours must be between 0 and {MAX_TTL_HOURS}.")
-
-    if policy is None and policy_preset is not None:
-        policy = policy_preset
-
-    normalized_policy = normalize_policy(policy, overrides=policy_overrides)
-
-    topic_uuid = f"agy_{uuid.uuid4().hex}"
-    aes_key = AESGCM.generate_key(bit_length=256)
-    psk_b64 = base64.b64encode(aes_key).decode("ascii")
-    
-    # Calculate expiration timestamp (ttl_hours <= 0 or None means no expiration / permanent)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if ttl_hours > 0:
-        expires_dt = now + datetime.timedelta(hours=ttl_hours)
-        expires_at_str = expires_dt.isoformat()
-    else:
-        expires_at_str = None
-    
-    # Save the pending pairing into our local registry with policy
-    placeholder_id = f"pending_{topic_uuid}"
-    save_pairing(
-        remote_conversation_id=placeholder_id,
-        topic=topic_uuid,
-        psk_b64=psk_b64,
-        local_conversation_id=local_conversation_id,
-        alias=recipient_hint,
-        expires_at=expires_at_str,
-        policy=normalized_policy,
-    )
-    
-    token_dict = {
-        "v": 2,
-        "topic": topic_uuid,
-        "key": psk_b64,
-        "sender_id": local_conversation_id,
-        "relays": DEFAULT_RELAYS,
-        "hint": recipient_hint,
-        "expires_at": expires_at_str,
-        "policy": normalized_policy,
-    }
-    
-    token_bytes = json.dumps(token_dict).encode("utf-8")
-    token_b64 = base64.urlsafe_b64encode(token_bytes).decode("ascii").rstrip("=")
-    token_str = f"{TOKEN_PREFIX}{token_b64}"
-    
-    log_debug(f"[PairingToken] Generated token for '{local_conversation_id}' on topic '{topic_uuid}' (Policy: {normalized_policy.get('mode')}, TTL: {ttl_hours}h, Expires: {expires_at_str})")
-    return token_str
-
-def consume_pairing_token(
-    token_str: str,
-    my_conversation_id: str,
-    allow_permanent: bool = False,
-) -> dict:
-    my_conversation_id = runtime_adapter.validate_identity(
-        my_conversation_id, "my_conversation_id"
-    )
-    if not isinstance(token_str, str):
-        raise ValueError("Pairing token must be a string.")
-    token_str = token_str.strip()
-    if len(token_str) > MAX_PAIRING_TOKEN_CHARS:
-        raise ValueError("Pairing token is too long.")
-    if not token_str.startswith(TOKEN_PREFIX):
-        raise ValueError(f"Pairing token must start with {TOKEN_PREFIX}.")
-    raw_b64 = token_str[len(TOKEN_PREFIX):]
-        
-    # Add padding if needed
-    padding = len(raw_b64) % 4
-    if padding != 0:
-        raw_b64 += "=" * (4 - padding)
-        
-    try:
-        token_bytes = base64.b64decode(raw_b64, altchars=b"-_", validate=True)
-        token_dict = json.loads(token_bytes.decode("utf-8"))
-    except Exception as e:
-        raise ValueError(f"Invalid or corrupted pairing token: {e}")
-        
-    if not isinstance(token_dict, dict) or token_dict.get("v") != 2:
-        raise ValueError("Unsupported pairing token version (version 2 with security policy required).")
-
-    raw_policy = token_dict.get("policy")
-    if not isinstance(raw_policy, dict):
-        raise ValueError("Pairing token is missing required security policy (tokens without explicit policy are rejected fail-closed).")
-    token_policy = normalize_policy(raw_policy)
-
-    topic = token_dict.get("topic")
-    psk_b64 = token_dict.get("key")
-    remote_sender_id = token_dict.get("sender_id")
-    expires_at = token_dict.get("expires_at")
-    relay_urls = _validate_relay_urls(token_dict.get("relays", DEFAULT_RELAYS))
-    
-    if not topic or not psk_b64 or not remote_sender_id:
-        raise ValueError("Pairing token is missing required connection fields.")
-
-    if not isinstance(topic, str) or not PAIRING_TOPIC_RE.fullmatch(topic):
-        raise ValueError("Pairing token contains an invalid topic.")
-    psk_bytes = _decode_psk(psk_b64)
-    remote_sender_id = runtime_adapter.validate_identity(remote_sender_id, "sender_id")
-        
-    # Validate TTL expiration
-    if expires_at:
-        exp_dt = _parse_expiration(expires_at)
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if now > exp_dt:
-            raise ValueError(f"Pairing token expired at {expires_at}. Please request a fresh pairing token.")
-        if exp_dt - now > datetime.timedelta(hours=MAX_TTL_HOURS):
-            raise ValueError("Pairing token expiration exceeds the maximum allowed TTL.")
-    elif not allow_permanent:
-        raise ValueError(
-            "Permanent pairing token requires allow_permanent=True after explicit user approval."
-        )
-            
-    save_pairing(
-        remote_conversation_id=remote_sender_id,
-        topic=topic,
-        psk_b64=psk_b64,
-        local_conversation_id=my_conversation_id,
-        alias=token_dict.get("hint", ""),
-        expires_at=expires_at,
-        policy=token_policy,
-    )
-    
-    # Send an encrypted handshake message to the remote agent over Nostr
-    log_debug(f"[PairingToken] Consumed token. Sending handshake to '{remote_sender_id}' on topic '{topic}' under policy '{token_policy.get('mode')}'...")
-    handshake_payload = {
-        "type": "handshake",
-        "message_id": str(uuid.uuid4()),
-        "sender_conversation_id": my_conversation_id,
-        "recipient_conversation_id": remote_sender_id,
-        "content": f"Pairing successful! Connected securely via E2EE on topic '{topic}'.",
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "expires_at": (
-            datetime.datetime.now(datetime.timezone.utc)
-            + datetime.timedelta(minutes=10)
-        ).isoformat(),
-    }
-    
-    def _send_handshake():
-        try:
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            asyncio.run(_async_publish_raw(
-                topic=topic,
-                recipient_id=remote_sender_id,
-                payload_dict=handshake_payload,
-                psk_bytes=psk_bytes,
-                relay_urls=relay_urls
-            ))
-        except Exception as e:
-            log_debug(f"[PairingToken] Handshake publish error: {e}")
-            
-    threading.Thread(target=_send_handshake, daemon=True).start()
-    
-    exp_info = f" (Valid until {expires_at})" if expires_at else ""
-    return {
-        "status": "paired",
-        "remote_conversation_id": remote_sender_id,
-        "topic": topic,
-        "expires_at": expires_at,
-        "policy": token_policy,
-        "message": f"Successfully paired with remote conversation '{remote_sender_id}' on encrypted channel '{topic}'{exp_info} under policy '{token_policy.get('mode', 'custom')}'."
-    }
-
 # ---------------------------------------------------------------------------
 # Cryptography & Payload Packaging
 # ---------------------------------------------------------------------------
@@ -971,7 +797,7 @@ def _gzip_decompress_limited(compressed_bytes: bytes) -> bytes:
         raise ValueError("Decompressed attachment exceeds the configured size limit.")
     return raw_bytes
 
-def resolve_attachment_path(path: str) -> str:
+def resolve_attachment_path(path: str, *, attachment_root=None) -> str:
     if not path:
         return None
     candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
@@ -979,7 +805,16 @@ def resolve_attachment_path(path: str) -> str:
         if not runtime_adapter.is_antigravity_runtime():
             configured = os.environ.get("INTERCOM_ALLOWED_ATTACHMENT_ROOTS", "")
             raw_roots = [part for part in configured.split(os.pathsep) if part]
-            roots = raw_roots or [os.path.join(os.getcwd(), ".intercom-share")]
+            roots = raw_roots or [str(attachment_root or Path(os.getcwd()) / ".intercom-share")]
+            if attachment_root is not None:
+                # A shared MCP process must not export another chat's files.
+                # Both its configured roots AND this owner's share root apply.
+                owner_root = os.path.realpath(str(attachment_root))
+                try:
+                    if os.path.normcase(os.path.commonpath([candidate, owner_root])) != os.path.normcase(owner_root):
+                        raise PermissionError("Attachment is outside this chat's share root")
+                except ValueError:
+                    raise PermissionError("Attachment is outside this chat's share root") from None
             allowed = False
             for raw_root in roots:
                 root = os.path.realpath(os.path.abspath(os.path.expanduser(raw_root)))
@@ -995,14 +830,14 @@ def resolve_attachment_path(path: str) -> str:
                     "Attachment path is outside INTERCOM_ALLOWED_ATTACHMENT_ROOTS."
                 )
         return candidate
-        
+
     log_debug(f"[PathResolver] Attachment path not found on disk: '{path}'")
     return None
 
 def upload_to_blossom(data_bytes: bytes, keys: nostr_sdk.Keys) -> str:
     armored_text = base64.b64encode(data_bytes)
     sha256_hex = hashlib.sha256(armored_text).hexdigest()
-    
+
     for upload_url in DEFAULT_BLOSSOM_SERVERS:
         try:
             _validate_blossom_url(upload_url)
@@ -1011,16 +846,16 @@ def upload_to_blossom(data_bytes: bytes, keys: nostr_sdk.Keys) -> str:
             p_tag = nostr_sdk.Tag.parse(["payload", sha256_hex])
             x_tag = nostr_sdk.Tag.parse(["x", sha256_hex])
             t_tag = nostr_sdk.Tag.parse(["t", "upload"])
-            
+
             builder = nostr_sdk.EventBuilder(nostr_sdk.Kind(24242), "").tags([u_tag, m_tag, p_tag, x_tag, t_tag])
             event = builder.sign_with_keys(keys)
             auth_header = "Nostr " + base64.b64encode(event.as_json().encode("utf-8")).decode("ascii")
-            
+
             req = urllib.request.Request(upload_url, data=armored_text, method="PUT")
             req.add_header("Authorization", auth_header)
             req.add_header("Content-Type", "text/plain")
             req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            
+
             with _open_blossom_request(req, timeout=15) as resp:
                 response_bytes = resp.read(64 * 1024 + 1)
                 if len(response_bytes) > 64 * 1024:
@@ -1033,7 +868,7 @@ def upload_to_blossom(data_bytes: bytes, keys: nostr_sdk.Keys) -> str:
                     return file_url
         except Exception as e:
             log_debug(f"[Blossom] Upload error to {upload_url}: {e}")
-            
+
     raise RuntimeError("Failed to upload encrypted attachment to any Blossom server.")
 
 # ---------------------------------------------------------------------------
@@ -1049,42 +884,46 @@ async def _async_publish_raw(topic: str, recipient_id: str, payload_dict: dict, 
     keys = nostr_sdk.Keys.generate()
     signer = nostr_sdk.NostrSigner.keys(keys)
     client = nostr_sdk.Client(signer)
-    
+
     for url_str in relay_urls:
         try:
             url = nostr_sdk.RelayUrl.parse(url_str)
             await client.add_relay(url)
         except Exception:
             pass
-            
-    await client.connect()
-    
-    use_wire_v2 = os.environ.get("INTERCOM_WIRE_V2") == "1"
-    content_str = encrypt_payload_aes_gcm(
-        payload_dict,
-        psk_bytes,
-        topic=topic,
-        authenticated_topic=use_wire_v2,
-    )
-    tags = [
-        nostr_sdk.Tag.parse(["t", topic]),
-        nostr_sdk.Tag.parse(["d", "antigravity-intercom"]),
-        nostr_sdk.Tag.parse(
-            ["e2ee", "aes-256-gcm-v2" if use_wire_v2 else "aes-256-gcm"]
-        )
-    ]
-        
-    builder = nostr_sdk.EventBuilder(nostr_sdk.Kind(INTERCOM_KIND), content_str).tags(tags)
-    output = await client.send_event_builder(builder)
-    
-    succ = [str(r) for r in output.success]
-    fail = {str(r): str(err) for r, err in output.failed.items()}
-    if not succ:
-        raise RuntimeError(f"No relay accepted the event. Failures: {fail}")
-    log_debug(f"[Publisher] Published event {output.id.to_hex()} on topic '{topic}' -> Success: {succ}, Failed: {fail}")
-    return output.id.to_hex()
 
-async def _async_publish(sender_conversation_id: str, recipient_conversation_id: str, content: str, attachment_path: str, topic: str, relay_urls: list):
+    try:
+        await client.connect()
+
+        use_wire_v2 = os.environ.get("INTERCOM_WIRE_V2") == "1"
+        content_str = encrypt_payload_aes_gcm(
+            payload_dict,
+            psk_bytes,
+            topic=topic,
+            authenticated_topic=use_wire_v2,
+        )
+        tags = [
+            nostr_sdk.Tag.parse(["t", topic]),
+            nostr_sdk.Tag.parse(["d", "antigravity-intercom"]),
+            nostr_sdk.Tag.parse(
+                ["e2ee", "aes-256-gcm-v2" if use_wire_v2 else "aes-256-gcm"]
+            )
+        ]
+
+        builder = nostr_sdk.EventBuilder(nostr_sdk.Kind(INTERCOM_KIND), content_str).tags(tags)
+        output = await client.send_event_builder(builder)
+
+        succ = [str(r) for r in output.success]
+        fail = {str(r): str(err) for r, err in output.failed.items()}
+        if not succ:
+            raise RuntimeError(f"No relay accepted the event. Failures: {fail}")
+        log_debug(f"[Publisher] Published event {output.id.to_hex()} on topic '{topic}' -> Success: {succ}, Failed: {fail}")
+        return output.id.to_hex()
+    finally:
+        await client.shutdown()
+
+
+async def _async_publish(sender_conversation_id: str, recipient_conversation_id: str, content: str, attachment_path: str, topic: str, relay_urls: list, *, connection=None, sign_payload=None, attachment_root=None):
     sender_conversation_id = runtime_adapter.validate_identity(
         sender_conversation_id, "sender_conversation_id"
     )
@@ -1099,9 +938,11 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
         )
     relay_urls = _validate_relay_urls(relay_urls)
     # Check if a pairing exists for recipient
-    pairing = get_pairing_for_recipient(recipient_conversation_id, sender_conversation_id)
+    pairing = connection
+    if not pairing or not sign_payload or pairing.get("protocol") != "intercom-private-session-v1":
+        raise RuntimeError("An authenticated private connection is required; shared-channel sending is unsupported")
     psk_bytes = None
-    
+
     if pairing:
         topic = pairing.get("topic", topic)
         if "preshared_key" in pairing:
@@ -1116,8 +957,8 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
         )
     topic = sanitize_topic(topic)
     keys = nostr_sdk.Keys.generate()
-    
-    resolved_path = resolve_attachment_path(attachment_path)
+
+    resolved_path = resolve_attachment_path(attachment_path, attachment_root=attachment_root)
     if attachment_path and not resolved_path:
         raise FileNotFoundError(f"Attachment file was not found: {attachment_path}")
     attachment_obj = None
@@ -1127,14 +968,14 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
             mime_type, _ = mimetypes.guess_type(resolved_path)
             if not mime_type:
                 mime_type = "application/octet-stream"
-                
+
             with open(resolved_path, "rb") as f:
                 raw_bytes = f.read(MAX_ATTACHMENT_BYTES + 1)
             if len(raw_bytes) > MAX_ATTACHMENT_BYTES:
                 raise ValueError("Attachment exceeds the configured size limit.")
-                
+
             compressed_bytes = gzip.compress(raw_bytes)
-            
+
             # Hybrid threshold: If compressed size <= 45 KB, use inline Gzip+Base64. Else, use Encrypted Blossom upload.
             if len(compressed_bytes) <= 45 * 1024:
                 b64_data = base64.b64encode(compressed_bytes).decode("ascii")
@@ -1149,13 +990,13 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
                 aes_key = AESGCM.generate_key(bit_length=256)
                 aesgcm = AESGCM(aes_key)
                 nonce = os.urandom(12)
-                
+
                 encrypted_bytes = aesgcm.encrypt(nonce, compressed_bytes, None)
                 armored_sha256 = hashlib.sha256(base64.b64encode(encrypted_bytes)).hexdigest()
-                
+
                 log_debug(f"[Publisher] Large file detected ({len(raw_bytes)} bytes). Encrypting with AES-256-GCM & uploading to Blossom...")
                 blossom_file_url = upload_to_blossom(encrypted_bytes, keys)
-                
+
                 attachment_obj = {
                     "file_name": file_name,
                     "mime_type": mime_type,
@@ -1166,11 +1007,11 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
                     "sha256": armored_sha256
                 }
                 log_debug(f"[Publisher] Encrypted Blossom attachment packaged for '{file_name}'")
-                
+
         except Exception as att_err:
             log_debug(f"[Publisher] Error packaging attachment: {att_err}")
             raise RuntimeError("Failed to package the requested attachment.") from att_err
-            
+
     message_now = datetime.datetime.now(datetime.timezone.utc)
     payload_dict = {
         "type": "message",
@@ -1183,52 +1024,8 @@ async def _async_publish(sender_conversation_id: str, recipient_conversation_id:
     }
     if attachment_obj:
         payload_dict["attachment"] = attachment_obj
-        
-    return await _async_publish_raw(topic, recipient_conversation_id, payload_dict, psk_bytes, relay_urls)
 
-def publish_nostr_intercom_message(sender_conversation_id: str, recipient_conversation_id: str, content: str, attachment_path: str = None, topic: str = None, relays: list = None):
-    if not relays:
-        relays = DEFAULT_RELAYS
-        
-    result_container = []
-    error_container = []
-    
-    def _target():
-        try:
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            eid = asyncio.run(
-                asyncio.wait_for(
-                    _async_publish(
-                        sender_conversation_id,
-                        recipient_conversation_id,
-                        content,
-                        attachment_path,
-                        topic,
-                        relays,
-                    ),
-                    timeout=20,
-                )
-            )
-            result_container.append(eid)
-        except Exception as e:
-            error_container.append(e)
-            
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout=25)
-    
-    if result_container:
-        log_debug(f"Message published successfully. Event ID: {result_container[0]}")
-        return f"Message published successfully to Nostr relays. Event ID: {result_container[0]}"
-    elif error_container:
-        log_debug(f"Error publishing message: {error_container[0]}")
-        raise RuntimeError(
-            f"Error publishing message to Nostr relays: {error_container[0]}"
-        ) from error_container[0]
-    else:
-        log_debug("Error publishing message: Request timed out after 25s")
-        raise TimeoutError("Publishing to Nostr relays timed out after 25 seconds.")
+    return await _async_publish_raw(topic, recipient_conversation_id, sign_payload(payload_dict), psk_bytes, relay_urls)
 
 # ---------------------------------------------------------------------------
 # Inbound Notification Handler & Listener Daemon
@@ -1238,11 +1035,11 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
     def __init__(self):
         super().__init__()
         self.home_dir = os.path.expanduser("~")
-        
+
     async def handle(self, relay_url, subscription_id, event):
         try:
             event_id = event.id().to_hex()
-            
+
             with SEEN_EVENTS_LOCK:
                 if event_id in SEEN_EVENTS:
                     return
@@ -1250,7 +1047,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                 if len(SEEN_EVENTS) > 3000:
                     SEEN_EVENTS.clear()
                     SEEN_EVENTS.add(event_id)
-                    
+
             raw_content = event.content()
             if not isinstance(raw_content, str) or len(raw_content) > MAX_EVENT_CONTENT_CHARS:
                 log_debug_rate_limited(
@@ -1258,7 +1055,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     "[Nostr Intercom Listener] Dropping invalid or oversized relay event.",
                 )
                 return
-            
+
             try:
                 event_ts = event.created_at().as_secs()
                 cutoff_ts = int((LISTENER_START_TIME - datetime.timedelta(seconds=60)).timestamp())
@@ -1273,7 +1070,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     "invalid-event-timestamp",
                     f"[Nostr Intercom Listener] Timestamp parse warning: {ts_err}",
                 )
-            
+
             # Extract topic tag from event
             event_topic = None
             for t in event.tags().to_vec():
@@ -1281,7 +1078,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                 if len(t_vec) >= 2 and t_vec[0] == "t":
                     event_topic = t_vec[1]
                     break
-                    
+
             if not event_topic:
                 log_debug_rate_limited(
                     "missing-topic",
@@ -1289,193 +1086,24 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                 )
                 return
 
-            psk_bytes = get_psk_for_topic(event_topic)
-            data = None
-            
-            # Attempt 1: Decrypt with topic PSK if available
-            if psk_bytes:
-                try:
-                    data = decrypt_payload_aes_gcm(raw_content, psk_bytes, topic=event_topic)
-                except Exception as dec_err:
-                    log_debug_rate_limited(
-                        f"decrypt-failed:{sanitize_topic(event_topic)}",
-                        f"[Nostr Intercom Listener] Dropping events that fail channel authentication: {dec_err}",
-                    )
-
-            # Plaintext compatibility is explicit opt-in. New installations
-            # fail closed so an unpaired relay event can never inject content.
-            legacy_plaintext_allowed = _legacy_plaintext_allowed(
-                event_topic, psk_bytes
-            )
-            if not data and legacy_plaintext_allowed:
-                try:
-                    data = json.loads(raw_content)
-                except Exception as json_err:
-                    log_debug_rate_limited(
-                        "legacy-plaintext-invalid",
-                        f"[Nostr Intercom Listener] Invalid legacy plaintext event: {json_err}",
-                    )
-                    return
-
-            if not data:
-                log_debug_rate_limited(
-                    "unauthenticated-payload",
-                    "[Nostr Intercom Listener] Refusing unauthenticated relay events.",
-                )
+            import connections
+            verified = await connections.receive(event_topic, raw_content)
+            if verified is None:
                 return
-                    
-            msg_type = data.get("type", "message")
-            sender_id = data.get("sender_conversation_id")
-            recipient_id = data.get("recipient_conversation_id")
+            data, topic_info = verified
+            msg_type = "message"
+            sender_id = data["sender_conversation_id"]
+            recipient_id = data["recipient_conversation_id"]
             orig_content = data.get("content", "")
-
-            if msg_type not in {"message", "handshake"}:
-                log_debug(f"[Nostr Intercom Listener] Unsupported message type: {msg_type!r}")
-                return
             if not isinstance(orig_content, str) or len(orig_content) > MAX_MESSAGE_CONTENT_CHARS:
-                log_debug("[Nostr Intercom Listener] Message content is invalid or too large.")
                 return
-
-            message_id = data.get("message_id")
-            if message_id:
-                try:
-                    runtime_adapter.validate_identity(message_id, "message_id")
-                except ValueError:
-                    log_debug("[Nostr Intercom Listener] Message has an invalid message_id.")
-                    return
-            payload_expiration = data.get("expires_at")
-            if payload_expiration:
-                try:
-                    expires_at = _parse_expiration(payload_expiration)
-                except ValueError:
-                    log_debug("[Nostr Intercom Listener] Message expiration is invalid.")
-                    return
-                message_now = datetime.datetime.now(datetime.timezone.utc)
-                if message_now > expires_at:
-                    log_debug("[Nostr Intercom Listener] Expired message ignored.")
-                    return
-                if expires_at - message_now > datetime.timedelta(days=7, minutes=5):
-                    log_debug("[Nostr Intercom Listener] Message lifetime exceeds seven days.")
-                    return
-            
-            if not sender_id or not recipient_id:
-                log_debug(f"[Nostr Intercom Listener] Missing required conversation IDs: sender={sender_id}, recipient={recipient_id}")
-                return
-
-            try:
-                sender_id = runtime_adapter.validate_identity(sender_id, "sender_conversation_id")
-                recipient_id = runtime_adapter.validate_identity(recipient_id, "recipient_conversation_id")
-            except ValueError as identity_err:
-                log_debug(f"[Nostr Intercom Listener] Invalid identity: {identity_err}")
-                return
-
-            pairings_data = load_pairings()
-            topic_info = pairings_data.get("topics", {}).get(sanitize_topic(event_topic), {})
-            
-            # Find all local endpoints that have this topic registered
-            valid_local_recipients = set()
-            if topic_info.get("local_conversation_id"):
-                valid_local_recipients.add(topic_info.get("local_conversation_id"))
-            if topic_info.get("remote_conversation_id") and runtime_adapter.conversation_exists(topic_info.get("remote_conversation_id")):
-                valid_local_recipients.add(topic_info.get("remote_conversation_id"))
-                
-            valid_senders = set()
-            if topic_info.get("remote_conversation_id"):
-                valid_senders.add(topic_info.get("remote_conversation_id"))
-            if topic_info.get("local_conversation_id"):
-                valid_senders.add(topic_info.get("local_conversation_id"))
-
-            for pairing in pairings_data.get("pairings", {}).values():
-                if sanitize_topic(pairing.get("topic", "")) == sanitize_topic(event_topic):
-                    loc = pairing.get("local_conversation_id")
-                    rem = pairing.get("remote_conversation_id")
-                    if loc:
-                        valid_local_recipients.add(loc)
-                        valid_senders.add(loc)
-                    if rem:
-                        valid_senders.add(rem)
-                        if runtime_adapter.conversation_exists(rem):
-                            valid_local_recipients.add(rem)
-
-            if not valid_local_recipients:
-                log_debug(
-                    f"[Nostr Intercom Listener] Topic '{event_topic}' has no local binding. Ignoring."
-                )
-                return
-                
-            if recipient_id not in valid_local_recipients:
-                log_debug(
-                    f"[Nostr Intercom Listener] Authenticated payload targets '{recipient_id}', "
-                    f"which is not in valid local recipients {valid_local_recipients} for topic '{event_topic}'. Ignoring."
-                )
-                return
-
-            has_pending = any(s.startswith("pending_") for s in valid_senders)
-            if has_pending and msg_type == "handshake":
-                # Handshake from any sender completing pairing is allowed
-                pass
-            elif valid_senders and not any(s.startswith("pending_") for s in valid_senders):
-                if sender_id not in valid_senders:
-                    log_debug(
-                        f"[Nostr Intercom Listener] Authenticated sender '{sender_id}' does not "
-                        f"match paired peers {valid_senders}. Ignoring."
-                    )
-                    return
-            elif has_pending and msg_type != "handshake" and sender_id not in valid_senders:
-                log_debug(
-                    "[Nostr Intercom Listener] Pending pairing accepts only a handshake."
-                )
-                return
-
-            if not runtime_adapter.conversation_exists(recipient_id):
-                log_debug(f"[Nostr Intercom Listener] Local recipient '{recipient_id}' does not exist. Ignoring.")
-                return
-
-            try:
-                runtime_adapter.prepare_endpoint_for_message(recipient_id)
-            except RuntimeError as quota_error:
-                log_debug_rate_limited(
-                    f"endpoint-quota:{recipient_id}",
-                    f"[Nostr Intercom Listener] {quota_error}",
-                )
-                return
-
-            fingerprint = hashlib.sha256(
-                f"{sanitize_topic(event_topic)}\n{raw_content}".encode("utf-8")
-            ).hexdigest()
+            fingerprint = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
             if not runtime_adapter.claim_message_fingerprint(fingerprint):
-                log_debug(
-                    f"[Nostr Intercom Listener] Replayed ciphertext for event {event_id}. Ignoring."
-                )
                 return
 
-            log_debug(
-                f"[Nostr Intercom Listener] Authenticated event {event_id} "
-                f"for topic '{sanitize_topic(event_topic)}'."
-            )
-                
-            # If this is an incoming handshake from a pairing token acceptor:
-            if msg_type == "handshake":
-                log_debug(f"[Nostr Intercom Listener] Received pairing handshake from '{sender_id}' on topic '{event_topic}'")
-                if event_topic and psk_bytes:
-                    save_pairing(
-                        remote_conversation_id=sender_id,
-                        topic=event_topic,
-                        psk_b64=base64.b64encode(psk_bytes).decode("ascii"),
-                        local_conversation_id=recipient_id,
-                        alias="Paired Remote Agent",
-                        expires_at=topic_info.get("expires_at")
-                    )
-
-            channel_policy = topic_info.get("policy")
-            if not channel_policy:
-                for pairing in pairings_data.get("pairings", {}).values():
-                    if sanitize_topic(pairing.get("topic", "")) == sanitize_topic(event_topic):
-                        if pairing.get("policy"):
-                            channel_policy = pairing.get("policy")
-                            break
-            if not channel_policy:
-                channel_policy = normalize_policy(DEFAULT_POLICY_PRESET)
+            channel_policy = topic_info["policy"]
+            import codex_router
+            codex_router._policy(channel_policy)
 
             msg_id = str(uuid.uuid4())
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -1486,10 +1114,10 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
             attachment_error = None
             pending_attachment_bytes = None
             pending_attachment_file_name = None
-            
+
             accept_att = channel_policy.get("accept_attachments", "allow") == "allow"
             disarm_att = bool(channel_policy.get("disarm_attachments", True))
-            
+
             if attachment and not accept_att:
                 file_name = _safe_attachment_name(attachment.get("file_name", "attachment.bin")) if isinstance(attachment, dict) else "attachment.bin"
                 log_debug(f"[Nostr Intercom Listener] Attachment '{file_name}' rejected by channel policy.")
@@ -1505,7 +1133,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     if not isinstance(mime_type, str) or len(mime_type) > 200:
                         mime_type = "application/octet-stream"
                     encoding = attachment.get("encoding")
-                    
+
                     raw_bytes = None
                     if encoding == "gzip+base64":
                         b64_data = attachment.get("data")
@@ -1523,7 +1151,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                         b64_key = attachment.get("aes_key")
                         b64_nonce = attachment.get("nonce")
                         expected_sha256 = attachment.get("sha256")
-                        
+
                         _validate_blossom_url(blossom_url)
                         log_debug(f"[Nostr Intercom Listener] Downloading encrypted Blossom attachment from {blossom_url}...")
                         req = urllib.request.Request(blossom_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
@@ -1532,22 +1160,22 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                             dl_armored = resp.read(MAX_COMPRESSED_ATTACHMENT_BYTES + 1)
                         if len(dl_armored) > MAX_COMPRESSED_ATTACHMENT_BYTES:
                             raise ValueError("Encrypted attachment download exceeds the configured size limit.")
-                            
+
                         actual_sha256 = hashlib.sha256(dl_armored).hexdigest()
                         if expected_sha256 and actual_sha256 != expected_sha256:
                             raise ValueError(f"SHA256 mismatch! Expected {expected_sha256}, got {actual_sha256}")
-                            
+
                         encrypted_bytes = base64.b64decode(dl_armored, validate=True)
                         aes_key = _decode_psk(b64_key)
                         nonce = base64.b64decode(b64_nonce, validate=True)
                         if len(nonce) != 12:
                             raise ValueError("Attachment AES-GCM nonce must be 12 bytes.")
-                        
+
                         aesgcm = AESGCM(aes_key)
                         compressed_bytes = aesgcm.decrypt(nonce, encrypted_bytes, None)
                         raw_bytes = _gzip_decompress_limited(compressed_bytes)
                         log_debug(f"[Nostr Intercom Listener] Successfully downloaded, verified & decrypted Blossom attachment '{file_name}'")
-                        
+
                     if raw_bytes is not None:
                         disk_file_name = f"{file_name}{runtime_adapter.DISARM_SUFFIX}" if disarm_att else file_name
                         saved_file_path = (
@@ -1617,13 +1245,15 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                 f"--- UNTRUSTED INBOUND CONTENT END ---"
                 f"{attachment_info_str}"
             )
-            
+
             if not runtime_adapter.is_antigravity_runtime():
                 msg_payload = {
                     "id": msg_id,
                     "event_id": event_id,
+                    "connection_id": data["connection_id"],
                     "type": msg_type,
                     "recipient": recipient_id,
+                    "topic": sanitize_topic(event_topic),
                     "sender": sender_id,
                     "timestamp": timestamp,
                     "content": orig_content,
@@ -1635,6 +1265,8 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
             else:
                 msg_payload = {
                     "id": msg_id,
+                    "topic": sanitize_topic(event_topic),
+                    "connection_id": data["connection_id"],
                     "recipient": recipient_id,
                     "sender": sender_id,
                     "priority": "MESSAGE_PRIORITY_HIGH",
@@ -1643,7 +1275,7 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     "content": formatted_content,
                     "policy": channel_policy,
                 }
-            
+
             file_path = runtime_adapter.write_message_envelope(
                 recipient_id,
                 msg_payload,
@@ -1665,14 +1297,20 @@ class IntercomNotificationHandler(nostr_sdk.HandleNotification):
                     )
                 else:
                     self._trigger_wakeup(recipient_id, formatted_content)
+            elif runtime_adapter.get_runtime() == "codex":
+                import codex_router
+
+                await asyncio.to_thread(
+                    connections.wake, sanitize_topic(event_topic), recipient_id, msg_id
+                )
             else:
                 log_debug(
                     f"[Nostr Intercom Listener] Inbox message queued for '{recipient_id}'."
                 )
-            
+
         except Exception as e:
-            log_debug(f"Nostr Intercom Handler inner error: {e}")
-            
+            log_debug(f"[Connections] Dropped invalid event ({type(e).__name__}).")
+
     async def handle_msg(self, relay_url, msg):
         pass
 
@@ -1705,18 +1343,18 @@ if ($proc) {
                 log_debug("[Nostr Intercom Listener] language_server.exe discovery failed.")
                 return
             port, csrf_token = parts[0], parts[1]
-            
+
             ls_path = os.path.join(self.home_dir, "AppData", "Local", "Programs", "Antigravity", "resources", "bin", "language_server.exe")
             if not os.path.exists(ls_path):
                 ls_path = "language_server.exe"
-                
+
             env = os.environ.copy()
             for k in list(env.keys()):
                 if k.startswith("ANTIGRAVITY_"):
                     del env[k]
             env["ANTIGRAVITY_LS_ADDRESS"] = f"localhost:{port}"
             env["ANTIGRAVITY_CSRF_TOKEN"] = csrf_token
-            
+
             p_meta = subprocess.run(
                 [ls_path, "agentapi", "get-conversation-metadata", recipient_id],
                 env=env, capture_output=True, text=True, check=True,
@@ -1727,7 +1365,7 @@ if ($proc) {
             if not project_id:
                 log_debug("[Nostr Intercom Listener] Metadata project_id empty.")
                 return
-                
+
             env_send = os.environ.copy()
             for k in list(env_send.keys()):
                 if k.startswith("ANTIGRAVITY_"):
@@ -1737,49 +1375,45 @@ if ($proc) {
             env_send["ANTIGRAVITY_PROJECT_ID"] = project_id
             env_send["ANTIGRAVITY_LS_ADDRESS"] = f"localhost:{port}"
             env_send["ANTIGRAVITY_CSRF_TOKEN"] = csrf_token
-            
+
             res = subprocess.run(
                 [ls_path, "agentapi", "send-message", recipient_id, formatted_content],
                 env=env_send, capture_output=True, text=True, check=True,
                 creationflags=no_window
             )
-            log_debug(f"[Nostr Intercom Listener] Wakeup delivered successfully for {recipient_id}: {res.stdout}")
+            log_debug(f"[Nostr Intercom Listener] Wakeup delivered successfully for {recipient_id}.")
         except Exception as e:
-            log_debug(f"Nostr Wakeup Trigger error: {e}")
+            # CalledProcessError can include the complete send-message argv/body.
+            log_debug(f"Nostr Wakeup Trigger error: {type(e).__name__}.")
 
 def _listener_topics() -> set[str]:
-    topics = set(get_all_paired_topics())
-    if (
-        runtime_adapter.is_antigravity_runtime()
-        and os.environ.get("INTERCOM_ALLOW_LEGACY_PLAINTEXT") == "1"
-    ):
-        topics.add(get_default_topic())
-    return topics
+    import connections
+    return connections.active_topics()
 
 
 async def _run_listener_loop(relays: list):
     global ACTIVE_LISTENER_CLIENT, ACTIVE_LISTENER_TOPICS
-    
+
     keys = nostr_sdk.Keys.generate()
     signer = nostr_sdk.NostrSigner.keys(keys)
     client = nostr_sdk.Client(signer)
     ACTIVE_LISTENER_CLIENT = client
-    
+
     for url_str in relays:
         try:
             url = nostr_sdk.RelayUrl.parse(url_str)
             await client.add_relay(url)
         except Exception:
             pass
-            
+
     await client.connect()
     await asyncio.sleep(1)
-    
+
     # Subscribe only to authenticated pairing topics. The predictable legacy
     # topic is available solely for an explicit Antigravity migration mode.
     topics = _listener_topics()
     ACTIVE_LISTENER_TOPICS = topics
-    
+
     now_ts = nostr_sdk.Timestamp.from_secs(int((LISTENER_START_TIME - datetime.timedelta(seconds=60)).timestamp()))
     if topics:
         f = nostr_sdk.Filter().kind(nostr_sdk.Kind(INTERCOM_KIND)).hashtags(list(topics)).since(now_ts)
@@ -1787,12 +1421,14 @@ async def _run_listener_loop(relays: list):
         log_debug(f"[Nostr Intercom Listener] Subscribed to Kind {INTERCOM_KIND} topics {list(topics)} since {now_ts.as_secs()} across relays.")
     else:
         log_debug("[Nostr Intercom Listener] No active pairings; waiting for a topic.")
-    
+
     # Background task to monitor for newly added pairings, expired TTLs, deleted local conversations, and update subscriptions dynamically
+    import connections
+
     async def _topic_refresher():
         global ACTIVE_LISTENER_TOPICS
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(2)
             try:
                 # Trigger pruning on read
                 current_topics = _listener_topics()
@@ -1802,24 +1438,25 @@ async def _run_listener_loop(relays: list):
                         new_f = nostr_sdk.Filter().kind(nostr_sdk.Kind(INTERCOM_KIND)).hashtags(list(current_topics)).since(now_ts)
                         await client.subscribe(new_f, None)
                     ACTIVE_LISTENER_TOPICS = current_topics
+                await connections.pending_requests()
             except Exception as ref_err:
                 log_debug(f"[Nostr Intercom Listener] Topic refresher error: {ref_err}")
-                
+
     asyncio.create_task(_topic_refresher())
-    
+
     handler = IntercomNotificationHandler()
     await client.handle_notifications(handler)
 
 def start_background_nostr_listener(relays: list = None):
     if not relays:
         relays = DEFAULT_RELAYS
-        
+
     def _thread_entry():
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         log_debug("Starting background Nostr listener thread...")
         asyncio.run(_run_listener_loop(relays))
-        
+
     t = threading.Thread(target=_thread_entry, daemon=True)
     t.start()
     return t

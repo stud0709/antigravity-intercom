@@ -1,8 +1,9 @@
 """Host-specific state and inbox handling for Antigravity Intercom.
 
 The transport and cryptography are host agnostic.  This module keeps the
-Antigravity filesystem/wakeup conventions separate from Codex, whose supported
-integration surface is an MCP server plus a local inbox that the agent polls.
+Antigravity filesystem/wakeup conventions separate from Codex's local inbox.
+Explicitly registered Codex threads can receive policy-controlled notifications
+through the separate codex_router adapter after an inbox commit.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -257,7 +259,7 @@ def atomic_write_bytes(path: str | Path, payload: bytes) -> None:
 
 
 @contextmanager
-def registry_lock():
+def _registry_file_lock():
     """Serialize registry access across the MCP and listener processes."""
 
     lock_path = get_state_dir() / "intercom_pairings.lock"
@@ -285,6 +287,31 @@ def registry_lock():
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+_REGISTRY_LOCKS = threading.local()
+
+
+@contextmanager
+def registry_lock():
+    """Reentrant within one thread; still serialized across threads/processes.
+
+    Session authorization and inbox updates share this lock so revocation cannot
+    race a read or queue operation. Nested helpers must not open a second OS lock.
+    """
+    key = os.path.normcase(str(get_state_dir().resolve()))
+    held = getattr(_REGISTRY_LOCKS, "held", None)
+    if held is None:
+        held = _REGISTRY_LOCKS.held = set()
+    if key in held:
+        yield
+        return
+    with _registry_file_lock():
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.remove(key)
 
 
 def validate_identity(value: str, field_name: str = "conversation_id") -> str:
